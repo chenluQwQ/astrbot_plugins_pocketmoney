@@ -1070,7 +1070,7 @@ class PocketMoneyManager:
         return (False, 0, "申请不存在或已处理")
 
 
-@register("astrbot_plugin_pocketmoney", "柯尔", "贝塔的小金库系统，管理余额和收支记录", "1.7.0")
+@register("astrbot_plugin_pocketmoney", "柯尔", "贝塔的小金库系统，管理余额和收支记录", "1.7.1")
 # ==================== 版本历史 ====================
 # v1.0 - 基础零花钱：余额管理、入账/出账、记录查询
 # v1.1 - 表扬信/投诉信系统：每日限制、排行榜、随机奖金 
