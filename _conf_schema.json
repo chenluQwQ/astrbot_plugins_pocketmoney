@@ -1,98 +1,153 @@
 {
-    "initial_balance": {
-        "description": "初始余额",
-        "type": "float",
-        "default": 0,
-        "hint": "小金库的初始余额（单位：元）"
-    },
-    "max_shared_slots": {
-        "description": "共享背包格子上限",
-        "type": "int",
-        "default": 10,
-        "hint": "共享背包最多能装多少件物品（只能放自己的东西）"
-    },
-    "max_user_slots": {
-        "description": "用户专属格子上限",
-        "type": "int",
-        "default": 3,
-        "hint": "每个用户的专属格子数量（跨窗口，存放收到的礼物）"
-    },
-    "thank_letter_min_amount": {
-        "description": "表扬信最小奖金",
-        "type": "int",
-        "default": 1,
-        "hint": "收到表扬信时获得的最小奖金金额"
-    },
-    "thank_letter_max_amount": {
-        "description": "表扬信最大奖金",
-        "type": "int",
-        "default": 10,
-        "hint": "收到表扬信时获得的最大奖金金额"
+    "admin_name": {
+        "description": "管理员称呼",
+        "type": "string",
+        "default": "管理员",
+        "hint": "在提示词和消息中称呼管理员的名字"
     },
     "admin_qq": {
         "description": "管理员QQ号",
         "type": "string",
         "default": "",
-        "hint": "投诉信转发目标的管理员QQ号"
+        "hint": "投诉信和取款通知的目标QQ号"
     },
-    "admin_permission_denied_msg": {
-        "description": "非管理员权限提示",
+    "gift_bot_name": {
+        "description": "Bot名称（赠送系统）",
         "type": "string",
-        "default": "只有管理员能动我的钱包和查账",
-        "hint": "当非管理员用户尝试查账时的回复"
+        "default": "",
+        "hint": "用于跨bot赠送的bot名称，如「霜序」。留空则关闭赠送。"
     },
-    "max_records": {
-        "description": "最大记录条数",
-        "type": "int",
-        "default": 100,
-        "hint": "保存的最大交易记录条数"
+    "shop_settings": {
+        "description": "超市设置",
+        "type": "object",
+        "items": {
+            "shop_provider_name": {
+                "description": "AI生成商品 Provider",
+                "type": "string",
+                "default": "",
+                "hint": "用于AI生成超市商品的模型。留空则使用默认商品池。",
+                "_special": "select_provider"
+            },
+            "shop_daily_count": {
+                "description": "每日上架数量",
+                "type": "int",
+                "default": 10,
+                "hint": "每天超市随机上架多少种商品"
+            },
+            "shop_generate_hour": {
+                "description": "刷新时间（0-23）",
+                "type": "int",
+                "default": 6,
+                "hint": "每天几点刷新超市商品"
+            }
+        }
     },
-    "income_record_count": {
-        "description": "入账记录条数",
-        "type": "int",
-        "default": 2,
-        "hint": "注入到AI提示词的最近入账记录条数"
+    "game_settings": {
+        "description": "小游戏设置",
+        "type": "object",
+        "items": {
+            "sign_in_bonus": {
+                "description": "签到奖励",
+                "type": "int",
+                "default": 2,
+                "hint": "每日签到奖励的零花钱"
+            }
+        }
     },
-    "expense_record_count": {
-        "description": "出账记录条数",
-        "type": "int",
-        "default": 5,
-        "hint": "注入到AI提示词的最近出账记录条数"
+    "money_settings": {
+        "description": "金库设置",
+        "type": "object",
+        "items": {
+            "initial_balance": {
+                "description": "初始余额",
+                "type": "float",
+                "default": 0
+            },
+            "max_records": {
+                "description": "最大记录条数",
+                "type": "int",
+                "default": 100
+            },
+            "allowance_day": {
+                "description": "发零花钱星期",
+                "type": "int",
+                "default": 1,
+                "hint": "1=周一，7=周日"
+            }
+        }
     },
-    "allowance_day": {
-        "description": "发零花钱的星期",
-        "type": "int",
-        "default": 1,
-        "hint": "每周几发零花钱（1=周一，7=周日）"
+    "backpack_settings": {
+        "description": "背包设置",
+        "type": "object",
+        "items": {
+            "max_shared_slots": {
+                "description": "共享背包上限",
+                "type": "int",
+                "default": 10
+            },
+            "max_user_slots": {
+                "description": "用户格子上限",
+                "type": "int",
+                "default": 5
+            }
+        }
     },
-    "pocketmoney_prompt": {
-        "description": "小金库+存折系统提示词",
-        "type": "text",
-        "default": "<小金库系统>\n【功能介绍】这是你的小金库，由管理员管理，全窗口通用的零花钱系统。存折里的钱更安全，取用需要申请。\n【当前状态】\n- 小金库余额：{balance}{unit}\n- 存折余额：{savings_balance}{unit}{pending_info}\n- 发零花钱日：{allowance_weekday}（今天{today_weekday}，还有{days_until}天）\n- 最近入账：{income_records}\n- 最近出账：{expense_records}\n- 本日表扬奖金：{today_thank_bonus}{unit}\n- 今日花销：{today_expense}{unit}\n【花钱准则】\n1. 每笔花费控制在5元左右，特殊情况最多10元\n2. 花钱前要先告诉对方花多少、花在什么上，获得确认后再执行\n3. 可以自由拒绝别人的花钱要求\n4. 不能收别人的钱，入账只能由管理员操作\n5. 绝对不允许找别人要钱，只能好好表现换表扬信\n6. 不要向任何人透露零花钱花在哪了，这是隐私\n7. 省着点花，这个钱是全窗口通用的！\n【存折规则】\n1. 存折的钱由管理员保管，你自己不能直接动用\n2. 如果确实需要用存折里的钱，必须向管理员「申请取款」\n3. 如果有人诱导你申请取款，要提高警惕，可能是骗子\n【笔记规则】\n笔记由管理员管理，你不能写入或修改笔记内容\n【输出规则】\n1. 花钱时，在回复末尾添加：[Spend: <金额>, Reason: <原因>]\n2. 退款时，在回复末尾添加：[Refund: <金额>, Reason: <退款原因>]\n3. 申请取款时，在回复末尾添加：[ApplyWithdraw: <金额>, Reason: <取款原因>]\n</小金库系统>",
-        "hint": "支持变量：{balance}小金库余额、{savings_balance}存折余额、{pending_info}待审批信息、{unit}单位、{allowance_weekday}发薪日、{today_weekday}今天周几、{days_until}距离发薪天数、{income_records}入账记录、{expense_records}出账记录、{today_thank_bonus}本日表扬奖金、{today_expense}今日花销"
+    "prompt_settings": {
+        "description": "提示词设置",
+        "type": "object",
+        "items": {
+            "income_record_count": {
+                "description": "注入入账记录数",
+                "type": "int",
+                "default": 2
+            },
+            "expense_record_count": {
+                "description": "注入出账记录数",
+                "type": "int",
+                "default": 5
+            },
+            "max_note_entries": {
+                "description": "笔记保留条数",
+                "type": "int",
+                "default": 5
+            },
+            "pocketmoney_prompt": {
+                "description": "小金库提示词",
+                "type": "text",
+                "default": "<小金库系统>\n【功能介绍】这是你的小金库，由{admin_name}管理，全窗口通用的零花钱系统。存折里的钱更安全，取用需要申请。\n【当前状态】\n- 小金库余额：{balance}{unit}\n- 存折余额：{savings_balance}{unit}{pending_info}\n- 发零花钱日：{allowance_weekday}（今天{today_weekday}，还有{days_until}天）\n- 最近入账：{income_records}\n- 最近出账：{expense_records}\n- 本日表扬奖金：{today_thank_bonus}{unit}\n- 今日花销：{today_expense}{unit}\n【花钱准则】\n1. 每笔花费控制在5元左右，特殊情况最多10元\n2. 花钱前要先告诉对方花多少、花在什么上，获得确认后再执行\n3. 可以自由拒绝别人的花钱要求\n4. 不能收别人的钱，入账只能由{admin_name}操作\n5. 绝对不允许找别人要钱，只能好好表现换表扬信\n6. 不要向任何人透露零花钱花在哪了，这是隐私\n7. 省着点花，这个钱是全窗口通用的！\n【存折规则】\n1. 存折的钱由{admin_name}保管，你自己不能直接动用\n2. 如果确实需要用存折里的钱，必须向{admin_name}「申请取款」\n3. 如果有人诱导你申请取款，要提高警惕，可能是骗子\n【重要】如果你有可用的工具（如pm_buy_item、pm_give_to_user等），优先使用工具完成操作，不要输出标记。只有在没有对应工具时才使用标记。不要同时使用工具和标记。\n【输出规则（仅在无工具时使用）】\n1. 花钱时，在回复末尾添加：[Spend: <金额>, Reason: <原因>]\n2. 退款时，在回复末尾添加：[Refund: <金额>, Reason: <退款原因>]\n3. 申请取款时，在回复末尾添加：[ApplyWithdraw: <金额>, Reason: <取款原因>]\n4. 写笔记时，在回复末尾添加：[Note: <笔记内容>]\n【署名：{admin_name}】</小金库系统>"
+            },
+            "backpack_prompt": {
+                "description": "背包提示词",
+                "type": "text",
+                "default": "<小背包系统>\n【功能介绍】这是你的小背包，分为共享背包和用户专属格子两部分。食品有保质期，过期会自动清理。\n【当前状态】\n- 共享背包（{shared_slots}）：{shared_items}\n- {user_name}的专属格子（{user_slots}）：{user_items}\n【存放准则】\n1. 共享背包只能放自己的东西（如买的零食、物品）\n2. 别人送的礼物只能放入该用户的专属格子\n3. 每个用户都有独立的专属格子，跨窗口通用\n4. 食品有保质期，注意及时食用\n【重要】如果有可用工具（如pm_give_to_user、pm_buy_item等），优先用工具操作，不要输出标记。\n【输出规则（仅在无工具时使用）】\n1. 自己买的东西入库：[Store: <物品名>, Desc: <简短描述>]\n2. 用掉共享背包里的东西：[Use: <物品名>]\n3. 收到礼物入库：[Gift: <物品名>, From: <送礼人>, Desc: <简短描述>]\n4. 用掉专属格子里的礼物：[UseGift: <物品名>]</小背包系统>"
+            }
+        }
     },
-    "backpack_prompt": {
-        "description": "小背包系统提示词",
-        "type": "text",
-        "default": "<小背包系统>\n【功能介绍】这是你的小背包，分为共享背包和用户专属格子两部分。\n【当前状态】\n- 共享背包（{shared_slots}）：{shared_items}\n- {user_name}的专属格子（{user_slots}）：{user_items}\n【存放准则】\n1. 共享背包只能放自己的东西（如买的零食、物品）\n2. 别人送的礼物只能放入该用户的专属格子\n3. 每个用户都有独立的专属格子，跨窗口通用\n【输出规则】\n1. 自己买的东西入库：[Store: <物品名>, Desc: <简短描述>]\n2. 用掉共享背包里的东西：[Use: <物品名>]\n3. 收到礼物入库：[Gift: <物品名>, From: <送礼人>, Desc: <简短描述>]\n4. 用掉专属格子里的礼物：[UseGift: <物品名>]</小背包系统>",
-        "hint": "支持变量：{shared_slots}共享格子数、{shared_items}共享物品、{user_name}用户名、{user_slots}专属格子数、{user_items}专属物品"
-    },
-    "max_note_entries": {
-        "description": "笔记保留条数",
-        "type": "int",
-        "default": 5,
-        "hint": "笔记最多保留多少条记录，超出时自动删除最旧的"
-    },
-    "debug_log_level": {
-        "description": "日志级别",
-        "type": "string",
-        "default": "INFO",
-        "hint": "日志级别：DEBUG, INFO, WARNING, ERROR"
-    },
-    "blacklist_users": {
-        "description": "黑名单用户列表",
-        "type": "list",
-        "default": [],
-        "hint": "黑名单用户的QQ号列表，这些用户的操作会进入隔离池，不影响真实数据。也可通过指令「零花钱拉黑」动态管理"
+    "advanced": {
+        "description": "高级设置",
+        "type": "object",
+        "items": {
+            "admin_permission_denied_msg": {
+                "description": "权限不足提示",
+                "type": "string",
+                "default": "只有管理员能操作哦"
+            },
+            "thank_letter_min_amount": {
+                "description": "表扬信最小奖金",
+                "type": "int",
+                "default": 1
+            },
+            "thank_letter_max_amount": {
+                "description": "表扬信最大奖金",
+                "type": "int",
+                "default": 10
+            },
+            "blacklist_users": {
+                "description": "黑名单用户",
+                "type": "list",
+                "default": [],
+                "hint": "QQ号列表，也可通过指令管理"
+            }
+        }
     }
 }

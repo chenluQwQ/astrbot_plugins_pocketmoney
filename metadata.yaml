@@ -1,7 +1,7 @@
 name: astrbot_plugin_pocketmoney
-display_name: 贝塔零花钱系统
-desc: 给机器人设计的小金库系统和小背包系统，增加一些rp乐趣。
-help: 管理员指令：发零花钱、查账、查流水、存折存入、批准取款
-version: v1.8.0
-author: 柯尔
-repo: https://github.com/Luna-channel/astrbot_plugins_pocketmoney
+display_name: 零花钱系统
+desc: 虚拟经济系统：零花钱/超市/小游戏/银行/等级/成就/跨bot赠送
+help: 输入「零花钱帮助」查看全部指令
+version: v2.0.0
+author: 晨露
+repo: https://github.com/chenluQwQ/astrbot_plugin_pocketmoney

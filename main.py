@@ -1,8 +1,9 @@
-import json
 import re
 import os
+import json
 import random
-from typing import Dict, Any, List
+import asyncio
+from typing import List, Dict, Any
 from datetime import datetime, timedelta
 
 from astrbot.api.event import filter, AstrMessageEvent
@@ -10,1286 +11,246 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api import logger, AstrBotConfig
 
-
-class UserIsolationManager:
-    """
-    用户隔离池管理系统（共享池模式）
-    - 所有黑名单用户共享一个隔离池，在里面互相斗法
-    - 黑名单用户的操作只影响隔离池数据
-    - 进入/退出隔离池时，用户专属格子数据会迁移（不清空）
-    - 不提示用户进入了黑名单（静默处理）
-    """
-
-    def __init__(self, data_dir: str):
-        self.data_dir = data_dir
-        self.isolation_dir = os.path.join(data_dir, "isolation")
-        self.shared_isolation_dir = os.path.join(self.isolation_dir, "shared")
-        os.makedirs(self.shared_isolation_dir, exist_ok=True)
-        self.blacklist = self._load_blacklist()
-        self.pending_refunds = self._load_pending_refunds()
-        # 共享隔离池管理器（单例）
-        self._shared_managers: Dict[str, Any] = None
-        # 自动迁移旧版用户隔离池数据到共享池
-        self._migrate_old_isolation_data()
-
-    def _load_blacklist(self) -> List[str]:
-        """加载黑名单"""
-        path = os.path.join(self.data_dir, "blacklist.json")
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError):
-                pass
-        return []
-
-    def _save_blacklist(self):
-        """保存黑名单"""
-        path = os.path.join(self.data_dir, "blacklist.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.blacklist, f, ensure_ascii=False, indent=2)
-
-    def _migrate_old_isolation_data(self):
-        """
-        将旧版用户独立隔离池数据迁移到共享隔离池
-        旧结构: isolation/{user_id}/pocket_money.json, backpack.json
-        新结构: isolation/shared/pocket_money.json, backpack.json
-        """
-        if not os.path.exists(self.isolation_dir):
-            return
-        
-        # 检查是否已经迁移过（共享目录已有数据）
-        shared_money_file = os.path.join(self.shared_isolation_dir, "pocket_money.json")
-        if os.path.exists(shared_money_file):
-            # 已有共享数据，跳过迁移
-            return
-        
-        # 扫描旧的用户隔离目录
-        migrated_users = []
-        total_balance = 0
-        all_records = []
-        all_shared_items = []
-        all_user_slots = {}
-        
-        for item in os.listdir(self.isolation_dir):
-            user_dir = os.path.join(self.isolation_dir, item)
-            # 跳过 shared 目录和非目录项
-            if item == "shared" or not os.path.isdir(user_dir):
-                continue
-            
-            user_id = item
-            
-            # 读取用户的隔离池余额和记录
-            old_money_file = os.path.join(user_dir, "pocket_money.json")
-            if os.path.exists(old_money_file):
-                try:
-                    with open(old_money_file, "r", encoding="utf-8") as f:
-                        old_data = json.load(f)
-                        # 合并余额（取最高值，因为所有用户应该看到相同的初始余额）
-                        user_balance = old_data.get("balance", 0)
-                        if user_balance > total_balance:
-                            total_balance = user_balance
-                        # 合并记录
-                        for record in old_data.get("records", []):
-                            record["migrated_from"] = user_id
-                            all_records.append(record)
-                except (json.JSONDecodeError, IOError):
-                    pass
-            
-            # 读取用户的隔离池背包
-            old_backpack_file = os.path.join(user_dir, "backpack.json")
-            if os.path.exists(old_backpack_file):
-                try:
-                    with open(old_backpack_file, "r", encoding="utf-8") as f:
-                        old_bp = json.load(f)
-                        # 合并共享物品（去重）
-                        for item_data in old_bp.get("shared_items", []):
-                            if item_data not in all_shared_items:
-                                all_shared_items.append(item_data)
-                        # 合并用户专属格子
-                        for uid, items in old_bp.get("user_slots", {}).items():
-                            if uid not in all_user_slots:
-                                all_user_slots[uid] = []
-                            for item_data in items:
-                                if item_data not in all_user_slots[uid]:
-                                    all_user_slots[uid].append(item_data)
-                except (json.JSONDecodeError, IOError):
-                    pass
-            
-            migrated_users.append(user_id)
-        
-        if not migrated_users:
-            return
-        
-        # 按时间排序记录
-        all_records.sort(key=lambda x: x.get("time", ""))
-        
-        # 写入共享隔离池数据
-        shared_money_data = {
-            "balance": total_balance,
-            "records": all_records[-50:],  # 保留最近50条
-            "notes": [],
-            "savings_balance": 0,
-            "pending_withdrawals": []
-        }
-        with open(shared_money_file, "w", encoding="utf-8") as f:
-            json.dump(shared_money_data, f, ensure_ascii=False, indent=2)
-        
-        shared_backpack_file = os.path.join(self.shared_isolation_dir, "backpack.json")
-        shared_backpack_data = {
-            "shared_items": all_shared_items,
-            "user_slots": all_user_slots
-        }
-        with open(shared_backpack_file, "w", encoding="utf-8") as f:
-            json.dump(shared_backpack_data, f, ensure_ascii=False, indent=2)
-        
-        logger.info(f"[PocketMoney] 已迁移 {len(migrated_users)} 个用户的隔离池数据到共享池: {migrated_users}")
-        logger.info(f"[PocketMoney] 共享隔离池余额: {total_balance}元, 记录: {len(all_records)}条, 共享物品: {len(all_shared_items)}件")
-
-    def is_blacklisted(self, user_id: str) -> bool:
-        return str(user_id) in self.blacklist
-
-    def add_to_blacklist(self, user_id: str, real_money_mgr: 'PocketMoneyManager' = None, 
-                          real_backpack_mgr: 'BackpackManager' = None) -> bool:
-        """
-        将用户加入黑名单，并迁移其专属格子数据到隔离池
-        """
-        user_id = str(user_id)
-        if user_id not in self.blacklist:
-            self.blacklist.append(user_id)
-            self._save_blacklist()
-            
-            # 迁移用户专属格子数据到隔离池
-            if real_backpack_mgr:
-                self._migrate_user_slots_to_isolation(user_id, real_backpack_mgr)
-            
-            return True
-        return False
-
-    def remove_from_blacklist(self, user_id: str, real_backpack_mgr: 'BackpackManager' = None) -> bool:
-        """
-        将用户从黑名单移除，并迁移其专属格子数据回真实背包
-        """
-        user_id = str(user_id)
-        if user_id in self.blacklist:
-            # 迁移用户专属格子数据回真实背包
-            if real_backpack_mgr and self._shared_managers:
-                self._migrate_user_slots_from_isolation(user_id, real_backpack_mgr)
-            
-            self.blacklist.remove(user_id)
-            self._save_blacklist()
-            return True
-        return False
-
-    def _migrate_user_slots_to_isolation(self, user_id: str, real_backpack_mgr: 'BackpackManager'):
-        """
-        将用户的专属格子数据从真实背包迁移到隔离池
-        """
-        user_items = real_backpack_mgr.get_user_items(user_id)
-        if not user_items:
-            return
-        
-        # 获取隔离池背包管理器
-        managers = self._get_or_create_shared_managers(None, real_backpack_mgr)
-        isolated_backpack = managers["backpack"]
-        
-        # 迁移每个物品到隔离池
-        for item in user_items:
-            isolated_backpack.add_user_gift(
-                user_id,
-                item.get("name", ""),
-                item.get("description", ""),
-                item.get("from", "未知")
-            )
-        
-        # 从真实背包清除该用户的专属格子
-        real_backpack_mgr.clear_user_items(user_id)
-        logger.info(f"[PocketMoney] 已迁移用户 {user_id} 的 {len(user_items)} 件专属物品到隔离池")
-
-    def _migrate_user_slots_from_isolation(self, user_id: str, real_backpack_mgr: 'BackpackManager'):
-        """
-        将用户的专属格子数据从隔离池迁移回真实背包
-        """
-        if not self._shared_managers:
-            return
-        
-        isolated_backpack = self._shared_managers["backpack"]
-        user_items = isolated_backpack.get_user_items(user_id)
-        if not user_items:
-            return
-        
-        # 迁移每个物品回真实背包
-        for item in user_items:
-            real_backpack_mgr.add_user_gift(
-                user_id,
-                item.get("name", ""),
-                item.get("description", ""),
-                item.get("from", "未知")
-            )
-        
-        # 从隔离池清除该用户的专属格子
-        isolated_backpack.clear_user_items(user_id)
-        logger.info(f"[PocketMoney] 已迁移用户 {user_id} 的 {len(user_items)} 件专属物品回真实背包")
-
-    def get_blacklist(self) -> List[str]:
-        return self.blacklist.copy()
-
-    def _get_or_create_shared_managers(self, real_money_mgr: 'PocketMoneyManager', 
-                                         real_backpack_mgr: 'BackpackManager') -> Dict[str, Any]:
-        """
-        获取或创建共享隔离池管理器（懒加载单例）
-        """
-        if self._shared_managers is not None:
-            return self._shared_managers
-        
-        # 检查是否首次创建（需要复制真实数据）
-        money_file = os.path.join(self.shared_isolation_dir, "pocket_money.json")
-        if not os.path.exists(money_file) and real_money_mgr:
-            # 首次创建，复制当前真实余额
-            init_data = {
-                "balance": real_money_mgr.get_balance(),
-                "records": [],
-                "notes": []
-            }
-            with open(money_file, "w", encoding="utf-8") as f:
-                json.dump(init_data, f, ensure_ascii=False, indent=2)
-        
-        # 创建共享隔离管理器实例
-        isolated_money = PocketMoneyManager(self.shared_isolation_dir, 0, 50)
-        isolated_backpack = BackpackManager(self.shared_isolation_dir, 10, 3)
-        
-        self._shared_managers = {
-            "money": isolated_money,
-            "backpack": isolated_backpack
-        }
-        return self._shared_managers
-
-    def get_isolated_managers(self, user_id: str, real_money_mgr: 'PocketMoneyManager', 
-                               real_backpack_mgr: 'BackpackManager') -> Dict[str, Any]:
-        """
-        获取共享隔离池管理器（所有黑名单用户共用）
-        返回 {"money": PocketMoneyManager, "backpack": BackpackManager}
-        """
-        return self._get_or_create_shared_managers(real_money_mgr, real_backpack_mgr)
-
-    def _save_data(self):
-        """保存共享隔离池数据"""
-        if self._shared_managers:
-            self._shared_managers["money"]._save_data()
-            self._shared_managers["backpack"]._save_data()
-        self._save_blacklist()
-        self._save_pending_refunds()
-
-    def sync_expense_to_shared(self, amount: float, reason: str, operator_id: str, real_money_mgr: 'PocketMoneyManager'):
-        """将出账操作同步到共享隔离池（普通用户操作时调用）"""
-        if not self.blacklist:
-            return
-        managers = self._get_or_create_shared_managers(real_money_mgr, None)
-        mgr = managers["money"]
-        if amount <= mgr.get_balance():
-            mgr.add_expense(amount, reason, operator_id)
-
-    def sync_income_to_shared(self, amount: float, reason: str, operator_id: str, real_money_mgr: 'PocketMoneyManager'):
-        """将入账操作同步到共享隔离池（普通用户操作时调用）"""
-        if not self.blacklist:
-            return
-        managers = self._get_or_create_shared_managers(real_money_mgr, None)
-        managers["money"].add_income(amount, reason, operator_id)
-
-    def sync_store_to_shared(self, item_name: str, item_desc: str, real_backpack_mgr: 'BackpackManager'):
-        """将背包入库同步到共享隔离池"""
-        if not self.blacklist:
-            return
-        managers = self._get_or_create_shared_managers(None, real_backpack_mgr)
-        managers["backpack"].add_shared_item(item_name, item_desc)
-
-    def sync_use_to_shared(self, item_name: str, real_backpack_mgr: 'BackpackManager'):
-        """将背包使用同步到共享隔离池"""
-        if not self.blacklist:
-            return
-        managers = self._get_or_create_shared_managers(None, real_backpack_mgr)
-        managers["backpack"].use_shared_item(item_name)
-
-    def sync_set_balance_to_shared(self, new_balance: float, reason: str, operator_id: str, real_money_mgr: 'PocketMoneyManager'):
-        """将设置余额同步到共享隔离池"""
-        if not self.blacklist:
-            return
-        managers = self._get_or_create_shared_managers(real_money_mgr, None)
-        managers["money"].set_balance(new_balance, reason, operator_id)
-
-    def _load_pending_refunds(self) -> List[Dict]:
-        """加载隔离池待退款列表"""
-        path = os.path.join(self.shared_isolation_dir, "pending_refunds.json")
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError):
-                pass
-        return []
-
-    def _save_pending_refunds(self):
-        """保存隔离池待退款列表"""
-        path = os.path.join(self.shared_isolation_dir, "pending_refunds.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.pending_refunds, f, ensure_ascii=False, indent=2)
-
-    def add_pending_refund(self, amount: float, reason: str, operator_id: str):
-        """添加待退款（隔离池出账时调用，2小时后自动静默退款）"""
-        self.pending_refunds.append({
-            "amount": amount,
-            "reason": reason,
-            "operator_id": operator_id,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "refund_at": (datetime.now() + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
-        })
-        self._save_pending_refunds()
-
-    def process_pending_refunds(self, money_mgr: 'PocketMoneyManager'):
-        """处理到期的隔离池待退款（静默退回余额，并清除对应的isolation出账记录）"""
-        now = datetime.now()
-        remaining = []
-        refunded_total = 0
-        refunded_times = []  # 记录已退款的原始出账时间，用于清除记录
-        for refund in self.pending_refunds:
-            try:
-                refund_at = datetime.strptime(refund["refund_at"], "%Y-%m-%d %H:%M:%S")
-                if now >= refund_at:
-                    money_mgr.data["balance"] = round(money_mgr.get_balance() + refund["amount"], 2)
-                    refunded_total += refund["amount"]
-                    refunded_times.append(refund.get("time"))
-                    logger.debug(f"[PocketMoney] 隔离池静默退款: +{refund['amount']}元 (原因: {refund['reason']})")
-                else:
-                    remaining.append(refund)
-            except (ValueError, KeyError):
-                pass  # 跳过格式错误的记录
-        
-        if refunded_total > 0:
-            # 清除已退款的 isolation 出账记录（静默，不留痕迹）
-            if refunded_times:
-                money_mgr.data["records"] = [
-                    r for r in money_mgr.data.get("records", [])
-                    if not (r.get("isolation") and r.get("time") in refunded_times)
-                ]
-            money_mgr._save_data()
-            self.pending_refunds = remaining
-            self._save_pending_refunds()
-            logger.info(f"[PocketMoney] 隔离池静默退款合计: +{refunded_total}元，剩余待退款: {len(remaining)}条")
-        elif len(remaining) != len(self.pending_refunds):
-            self.pending_refunds = remaining
-            self._save_pending_refunds()
-
-
-class ThankLetterManager:
-    """
-    表扬信管理系统
-    - 记录每日发送限制（每账号每天一封）
-    - 记录历史表扬信排行
-    - 记录今日表扬奖金
-    """
-
-    def __init__(self, data_dir: str):
-        self.data_dir = data_dir
-        self._init_path()
-        self.data = self._load_data()
-
-    def _init_path(self):
-        """初始化数据目录"""
-        os.makedirs(self.data_dir, exist_ok=True)
-
-    def _load_data(self) -> Dict[str, Any]:
-        """加载表扬信数据"""
-        path = os.path.join(self.data_dir, "thank_letters.json")
-        if not os.path.exists(path):
-            return {
-                "daily_senders": {},  # {"2024-01-01": ["sender_id1", "sender_id2"]}
-                "ranking": {},  # {"sender_id": count}
-                "today_bonus": 0,  # 今日表扬奖金
-                "today_date": "",  # 今日日期
-                "total_bonus": 0  # 累计表扬奖金
-            }
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                # 确保所有字段存在
-                if "daily_senders" not in data:
-                    data["daily_senders"] = {}
-                if "ranking" not in data:
-                    data["ranking"] = {}
-                if "today_bonus" not in data:
-                    data["today_bonus"] = 0
-                if "today_date" not in data:
-                    data["today_date"] = ""
-                if "total_bonus" not in data:
-                    data["total_bonus"] = 0
-                return data
-        except (json.JSONDecodeError, TypeError):
-            return {
-                "daily_senders": {},
-                "ranking": {},
-                "today_bonus": 0,
-                "today_date": "",
-                "total_bonus": 0
-            }
-
-    def _save_data(self):
-        """保存表扬信数据"""
-        path = os.path.join(self.data_dir, "thank_letters.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-
-    def _check_and_reset_daily(self):
-        """检查并重置每日数据（24点重置）"""
-        today = datetime.now().strftime("%Y-%m-%d")
-        if self.data["today_date"] != today:
-            self.data["today_date"] = today
-            self.data["today_bonus"] = 0
-            # 清理过期的每日记录（保留最近7天）
-            cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-            self.data["daily_senders"] = {
-                k: v for k, v in self.data["daily_senders"].items() if k >= cutoff
-            }
-            self._save_data()
-
-    def can_send_today(self, sender_id: str) -> bool:
-        """检查该用户今天是否还能发送表扬信"""
-        self._check_and_reset_daily()
-        today = datetime.now().strftime("%Y-%m-%d")
-        today_senders = self.data["daily_senders"].get(today, [])
-        return sender_id not in today_senders
-
-    def record_thank_letter(self, sender_id: str, sender_name: str, amount: int) -> bool:
-        """
-        记录一封表扬信
-        :return: 是否成功
-        """
-        self._check_and_reset_daily()
-        today = datetime.now().strftime("%Y-%m-%d")
-        
-        # 检查今日是否已发送
-        if not self.can_send_today(sender_id):
-            return False
-        
-        # 记录今日发送者
-        if today not in self.data["daily_senders"]:
-            self.data["daily_senders"][today] = []
-        self.data["daily_senders"][today].append(sender_id)
-        
-        # 更新排行榜（使用sender_id作为key，同时存储sender_name）
-        ranking_key = f"{sender_id}|{sender_name}"
-        # 先查找是否有旧的记录（可能名字变了）
-        old_key = None
-        for key in self.data["ranking"]:
-            if key.startswith(f"{sender_id}|"):
-                old_key = key
-                break
-        if old_key and old_key != ranking_key:
-            # 名字变了，迁移数据
-            self.data["ranking"][ranking_key] = self.data["ranking"].pop(old_key) + 1
-        else:
-            self.data["ranking"][ranking_key] = self.data["ranking"].get(ranking_key, 0) + 1
-        
-        # 更新今日奖金
-        self.data["today_bonus"] += amount
-        self.data["total_bonus"] += amount
-        
-        self._save_data()
-        return True
-
-    def get_today_bonus(self) -> int:
-        """获取今日表扬奖金"""
-        self._check_and_reset_daily()
-        return self.data.get("today_bonus", 0)
-
-    def get_total_bonus(self) -> int:
-        """获取累计表扬奖金"""
-        return self.data.get("total_bonus", 0)
-
-    def get_ranking(self, top_n: int = 10) -> List[tuple]:
-        """获取表扬信排行榜"""
-        ranking = self.data.get("ranking", {})
-        # 排序并返回前N名
-        sorted_ranking = sorted(ranking.items(), key=lambda x: x[1], reverse=True)
-        return sorted_ranking[:top_n]
-
-
-class BackpackManager:
-    """
-    小背包管理系统
-    - 共享背包：AI自己的物品存储（10个格子，只能放自己的东西）
-    - 专属格子：每个用户有3个专属格子（跨窗口，存放收到的礼物）
-    - 数据结构: 
-      - shared_items: [{"name": str, "description": str, "time": str}]  # 共享背包
-      - user_slots: {"user_id": [{"name": str, "description": str, "from": str, "time": str}]}  # 用户专属格子
-    """
-
-    def __init__(self, data_dir: str, max_shared_slots: int = 10, max_user_slots: int = 3):
-        self.data_dir = data_dir
-        self.max_shared_slots = max_shared_slots
-        self.max_user_slots = max_user_slots
-        self._init_path()
-        self.data = self._load_data()
-
-    def _init_path(self):
-        """初始化数据目录"""
-        os.makedirs(self.data_dir, exist_ok=True)
-
-    def _load_data(self) -> Dict[str, Any]:
-        """加载背包数据"""
-        path = os.path.join(self.data_dir, "backpack.json")
-        if not os.path.exists(path):
-            return {"shared_items": [], "user_slots": {}}
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                # 兼容旧版本数据结构
-                if "items" in data and "shared_items" not in data:
-                    # 迁移旧数据
-                    data["shared_items"] = data.pop("items")
-                if "shared_items" not in data:
-                    data["shared_items"] = []
-                if "user_slots" not in data:
-                    data["user_slots"] = {}
-                return data
-        except (json.JSONDecodeError, TypeError):
-            return {"shared_items": [], "user_slots": {}}
-
-    def _save_data(self):
-        """保存背包数据"""
-        path = os.path.join(self.data_dir, "backpack.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-
-    # ========== 共享背包操作 ==========
-    
-    def get_shared_items(self) -> List[Dict[str, Any]]:
-        """获取共享背包所有物品"""
-        return self.data.get("shared_items", [])
-
-    def get_shared_item_count(self) -> int:
-        """获取共享背包物品数量"""
-        return len(self.data.get("shared_items", []))
-
-    def is_shared_full(self) -> bool:
-        """检查共享背包是否已满"""
-        return self.get_shared_item_count() >= self.max_shared_slots
-
-    def add_shared_item(self, name: str, description: str) -> bool:
-        """
-        添加物品到共享背包（AI自己的东西）
-        :return: 是否成功
-        """
-        if self.is_shared_full():
-            return False
-        
-        item = {
-            "name": name,
-            "description": description,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        self.data["shared_items"].append(item)
-        self._save_data()
-        return True
-
-    def use_shared_item(self, name: str) -> bool:
-        """
-        使用（移除）共享背包物品
-        :return: 是否成功
-        """
-        items = self.data.get("shared_items", [])
-        # 标准化输入名称用于模糊匹配
-        normalized_name = name.strip().lower().replace(" ", "").replace("\u3000", "")
-        for i, item in enumerate(items):
-            # 模糊匹配：忽略空格和大小写
-            item_normalized = item["name"].strip().lower().replace(" ", "").replace("\u3000", "")
-            if item_normalized == normalized_name or item["name"] == name:
-                items.pop(i)
-                self._save_data()
-                return True
-        return False
-
-    def clear_shared_items(self):
-        """清空共享背包"""
-        self.data["shared_items"] = []
-        self._save_data()
-
-    # ========== 用户专属格子操作 ==========
-    
-    def get_user_items(self, user_id: str) -> List[Dict[str, Any]]:
-        """获取指定用户的专属格子物品"""
-        return self.data.get("user_slots", {}).get(user_id, [])
-
-    def get_user_item_count(self, user_id: str) -> int:
-        """获取指定用户的专属格子物品数量"""
-        return len(self.get_user_items(user_id))
-
-    def is_user_slots_full(self, user_id: str) -> bool:
-        """检查指定用户的专属格子是否已满"""
-        return self.get_user_item_count(user_id) >= self.max_user_slots
-
-    def add_user_gift(self, user_id: str, name: str, description: str, from_who: str) -> bool:
-        """
-        添加礼物到用户专属格子
-        :param user_id: 用户ID
-        :param name: 物品名
-        :param description: 描述
-        :param from_who: 送礼人
-        :return: 是否成功
-        """
-        if self.is_user_slots_full(user_id):
-            return False
-        
-        if "user_slots" not in self.data:
-            self.data["user_slots"] = {}
-        if user_id not in self.data["user_slots"]:
-            self.data["user_slots"][user_id] = []
-        
-        item = {
-            "name": name,
-            "description": description,
-            "from": from_who,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        self.data["user_slots"][user_id].append(item)
-        self._save_data()
-        return True
-
-    def use_user_item(self, user_id: str, name: str) -> bool:
-        """
-        使用（移除）用户专属格子物品
-        :return: 是否成功
-        """
-        items = self.data.get("user_slots", {}).get(user_id, [])
-        # 标准化输入名称用于模糊匹配
-        normalized_name = name.strip().lower().replace(" ", "").replace("\u3000", "")
-        for i, item in enumerate(items):
-            # 模糊匹配：忽略空格和大小写
-            item_normalized = item["name"].strip().lower().replace(" ", "").replace("\u3000", "")
-            if item_normalized == normalized_name or item["name"] == name:
-                items.pop(i)
-                self._save_data()
-                return True
-        return False
-
-    def clear_user_items(self, user_id: str):
-        """清空指定用户的专属格子"""
-        if user_id in self.data.get("user_slots", {}):
-            self.data["user_slots"][user_id] = []
-            self._save_data()
-
-    def get_all_user_slots(self) -> Dict[str, List[Dict[str, Any]]]:
-        """获取所有用户的专属格子数据"""
-        return self.data.get("user_slots", {})
-
-    # ========== 格式化方法 ==========
-    
-    def format_shared_items_for_prompt(self) -> str:
-        """格式化共享背包物品列表用于提示词"""
-        items = self.get_shared_items()
-        if not items:
-            return "空空如也"
-        return "、".join([f"{item['name']}({item['description']})" for item in items])
-
-    def format_user_items_for_prompt(self, user_id: str) -> str:
-        """格式化用户专属格子物品列表用于提示词"""
-        items = self.get_user_items(user_id)
-        if not items:
-            return "空空如也"
-        return "、".join([f"{item['name']}(来自{item['from']}: {item['description']})" for item in items])
-
-
-
-class PocketMoneyManager:
-    """
-    小金库管理系统（含存折功能）
-    - 全局余额管理（不区分会话）
-    - 入账/出账记录
-    - 存折：需要审批才能取款的安全余额
-    - 笔记功能：管理员可编辑的备忘录（AI不可写入）
-    """
-
-    def __init__(self, data_dir: str, initial_balance: float = 0, max_records: int = 100):
-        self.data_dir = data_dir
-        self.initial_balance = initial_balance
-        self.max_records = max_records
-        self._init_path()
-        self.data = self._load_data()
-        self._migrate_savings_data()  # 迁移旧的存折数据
-
-    def _init_path(self):
-        """初始化数据目录"""
-        os.makedirs(self.data_dir, exist_ok=True)
-
-    def _load_data(self) -> Dict[str, Any]:
-        """加载金库数据"""
-        path = os.path.join(self.data_dir, "pocket_money.json")
-        if not os.path.exists(path):
-            return {"balance": self.initial_balance, "records": [], "savings_balance": 0, "pending_withdrawals": []}
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if "balance" not in data:
-                    data["balance"] = self.initial_balance
-                if "records" not in data:
-                    data["records"] = []
-                if "savings_balance" not in data:
-                    data["savings_balance"] = 0
-                if "pending_withdrawals" not in data:
-                    data["pending_withdrawals"] = []
-                return data
-        except (json.JSONDecodeError, TypeError):
-            return {"balance": self.initial_balance, "records": [], "savings_balance": 0, "pending_withdrawals": []}
-
-    def _migrate_savings_data(self):
-        """迁移旧的存折数据到小金库（仅执行一次）"""
-        old_path = os.path.join(self.data_dir, "savings_book.json")
-        if os.path.exists(old_path):
-            try:
-                with open(old_path, "r", encoding="utf-8") as f:
-                    old_data = json.load(f)
-                    if old_data.get("balance", 0) > 0:
-                        self.data["savings_balance"] = old_data.get("balance", 0)
-                    if old_data.get("pending_withdrawals"):
-                        self.data["pending_withdrawals"] = old_data.get("pending_withdrawals", [])
-                    self._save_data()
-                    logger.info(f"[PocketMoney] 已迁移旧存折数据: 余额{old_data.get('balance', 0)}元")
-                # 迁移完成后重命名旧文件，防止重复迁移覆盖数据
-                migrated_path = old_path + ".migrated"
-                os.rename(old_path, migrated_path)
-                logger.info(f"[PocketMoney] 旧存折文件已重命名为 {migrated_path}")
-            except (json.JSONDecodeError, IOError):
-                pass
-
-    def _save_data(self):
-        """保存金库数据"""
-        path = os.path.join(self.data_dir, "pocket_money.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-
-    def get_balance(self) -> float:
-        """获取当前余额"""
-        return self.data.get("balance", 0)
-
-    def get_recent_records(self, count: int = 5) -> List[Dict[str, Any]]:
-        """获取最近的记录"""
-        records = self.data.get("records", [])
-        return records[-count:] if records else []
-
-    def get_recent_income_records(self, count: int = 2) -> List[Dict[str, Any]]:
-        """获取最近的入账记录"""
-        records = self.data.get("records", [])
-        income_records = [r for r in records if r["type"] == "income"]
-        return income_records[-count:] if income_records else []
-
-    def get_recent_expense_records(self, count: int = 5) -> List[Dict[str, Any]]:
-        """获取最近的出账记录"""
-        records = self.data.get("records", [])
-        expense_records = [r for r in records if r["type"] == "expense"]
-        return expense_records[-count:] if expense_records else []
-
-    def get_today_expense(self) -> float:
-        """获取今日花销（从凌晨0点开始）"""
-        today = datetime.now().strftime("%Y-%m-%d")
-        records = self.data.get("records", [])
-        total = 0.0
-        for r in records:
-            if r["type"] == "expense" and r["time"].startswith(today):
-                total += r["amount"]
-        return total
-
-    def get_all_records(self) -> List[Dict[str, Any]]:
-        """获取所有记录"""
-        return self.data.get("records", [])
-
-    def add_income(self, amount: float, reason: str, operator_id: str = "") -> bool:
-        """
-        入账（只能由管理员操作）
-        :param amount: 金额（正数）
-        :param reason: 原因
-        :param operator_id: 操作人QQ号
-        :return: 是否成功
-        """
-        if amount <= 0:
-            return False
-        
-        self.data["balance"] = round(self.get_balance() + amount, 2)
-        record = {
-            "type": "income",
-            "amount": amount,
-            "reason": reason,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "operator_id": operator_id
-        }
-        self.data["records"].append(record)
-        
-        # 限制记录数量
-        if len(self.data["records"]) > self.max_records:
-            self.data["records"] = self.data["records"][-self.max_records:]
-        
-        self._save_data()
-        return True
-
-    def add_expense(self, amount: float, reason: str, operator_id: str = "", isolation: bool = False) -> bool:
-        """
-        出账（AI自主或管理员操作）
-        :param amount: 金额（正数）
-        :param reason: 原因
-        :param operator_id: 操作人QQ号（AI操作时为触发者QQ号）
-        :param isolation: 是否为隔离池出账（标记后可被过滤/自动退款）
-        :return: 是否成功
-        """
-        if amount <= 0:
-            return False
-        if amount > self.get_balance():
-            return False
-        
-        self.data["balance"] = round(self.get_balance() - amount, 2)
-        record = {
-            "type": "expense",
-            "amount": amount,
-            "reason": reason,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "operator_id": operator_id
-        }
-        if isolation:
-            record["isolation"] = True
-        self.data["records"].append(record)
-        
-        # 限制记录数量
-        if len(self.data["records"]) > self.max_records:
-            self.data["records"] = self.data["records"][-self.max_records:]
-        
-        self._save_data()
-        return True
-
-    def set_balance(self, amount: float, reason: str, operator_id: str = "") -> bool:
-        """
-        直接设置余额（管理员操作）
-        :param operator_id: 操作人QQ号
-        """
-        old_balance = self.get_balance()
-        self.data["balance"] = round(amount, 2)
-        
-        diff = amount - old_balance
-        record_type = "income" if diff >= 0 else "expense"
-        record = {
-            "type": record_type,
-            "amount": abs(diff),
-            "reason": f"[余额调整] {reason}",
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "operator_id": operator_id
-        }
-        self.data["records"].append(record)
-        
-        if len(self.data["records"]) > self.max_records:
-            self.data["records"] = self.data["records"][-self.max_records:]
-        
-        self._save_data()
-        return True
-
-    # ========== 笔记功能 ==========
-    
-    def get_notes(self) -> list:
-        """获取笔记列表"""
-        notes = self.data.get("notes", [])
-        # 兼容旧版本单字符串格式
-        if not notes and self.data.get("note"):
-            return [self.data.get("note")]
-        return notes
-    
-    def get_note(self) -> str:
-        """获取格式化的笔记内容（用于提示词）"""
-        notes = self.get_notes()
-        if not notes:
-            return ""
-        # 返回格式化的笔记列表
-        return "\n".join([f"{i+1}. {note}" for i, note in enumerate(notes)])
-    
-    def add_note(self, content: str, max_entries: int = 5) -> bool:
-        """
-        添加笔记条目（自动限制数量）
-        :param content: 笔记内容
-        :param max_entries: 最大保留条数
-        :return: 是否成功
-        """
-        content = content.strip()
-        if not content:
-            return False
-        
-        notes = self.data.get("notes", [])
-        # 兼容旧版本：迁移旧的单字符串笔记
-        if not notes and self.data.get("note"):
-            notes = [self.data.get("note")]
-            self.data.pop("note", None)
-        
-        notes.append(content)
-        
-        # 限制数量，删除最旧的
-        if len(notes) > max_entries:
-            notes = notes[-max_entries:]
-        
-        self.data["notes"] = notes
-        self._save_data()
-        return True
-    
-    def set_note(self, content: str, max_entries: int = 5) -> bool:
-        """
-        设置笔记（兼容旧接口，实际调用add_note）
-        """
-        return self.add_note(content, max_entries)
-    
-    def clear_notes(self) -> bool:
-        """清空所有笔记"""
-        self.data["notes"] = []
-        self.data.pop("note", None)  # 清理旧格式
-        self._save_data()
-        return True
-    
-    def clear_note(self) -> bool:
-        """清空笔记（兼容旧接口）"""
-        return self.clear_notes()
-    
-    def delete_note(self, index: int) -> bool:
-        """
-        删除指定索引的笔记条目（1-indexed）
-        :param index: 笔记序号（从1开始）
-        :return: 是否成功
-        """
-        notes = self.get_notes()
-        if not notes:
-            return False
-        
-        # 转换为0-indexed
-        idx = index - 1
-        if idx < 0 or idx >= len(notes):
-            return False
-        
-        # 确保 notes 是列表格式
-        if "notes" not in self.data:
-            self.data["notes"] = notes
-        
-        self.data["notes"].pop(idx)
-        self._save_data()
-        return True
-
-    # ========== 存折功能（需审批的安全余额） ==========
-    
-    def get_savings_balance(self) -> float:
-        """获取存折余额"""
-        return self.data.get("savings_balance", 0)
-
-    def deposit_to_savings(self, amount: float, reason: str, operator_id: str = "") -> bool:
-        """存入存折（从小金库转入）"""
-        if amount <= 0 or amount > self.get_balance():
-            return False
-        self.data["balance"] = round(self.get_balance() - amount, 2)
-        self.data["savings_balance"] = round(self.get_savings_balance() + amount, 2)
-        self.data["records"].append({
-            "type": "expense", "amount": amount,
-            "reason": f"[转入存折] {reason}",
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "operator_id": operator_id
-        })
-        self._save_data()
-        return True
-
-    def withdraw_from_savings(self, amount: float, reason: str, operator_id: str = "") -> bool:
-        """从存折取款（管理员直接操作，转入小金库）"""
-        if amount <= 0 or amount > self.get_savings_balance():
-            return False
-        self.data["savings_balance"] = round(self.get_savings_balance() - amount, 2)
-        self.data["balance"] = round(self.get_balance() + amount, 2)
-        self.data["records"].append({
-            "type": "income", "amount": amount,
-            "reason": f"[存折取款] {reason}",
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "operator_id": operator_id
-        })
-        self._save_data()
-        return True
-
-    def apply_withdrawal(self, amount: float, reason: str, source_info: dict = None) -> str:
-        """申请取款（AI发起，等待管理员审批）"""
-        if amount <= 0 or amount > self.get_savings_balance():
-            return ""
-        existing_ids = {w.get("id") for w in self.data.get("pending_withdrawals", [])}
-        for _ in range(100):
-            application_id = str(random.randint(1000, 9999))
-            if application_id not in existing_ids:
-                break
-        self.data["pending_withdrawals"].append({
-            "id": application_id, "amount": amount, "reason": reason,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "status": "pending", "source_info": source_info or {}
-        })
-        self._save_data()
-        return application_id
-
-    def get_pending_withdrawals(self) -> List[Dict[str, Any]]:
-        """获取待审批的取款申请"""
-        return [w for w in self.data.get("pending_withdrawals", []) if w.get("status") == "pending"]
-
-    def approve_withdrawal(self, application_id: str, operator_id: str = "", approve_reason: str = "") -> tuple:
-        """批准取款申请，返回 (成功, 金额, 原因, 来源信息)"""
-        for w in self.data.get("pending_withdrawals", []):
-            if w.get("id") == application_id and w.get("status") == "pending":
-                amount, reason = w.get("amount", 0), w.get("reason", "")
-                if amount > self.get_savings_balance():
-                    return (False, 0, "余额不足", {})
-                w["status"] = "approved"
-                w["approved_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                if approve_reason:
-                    w["approve_reason"] = approve_reason
-                withdraw_reason = f"[申请取款] {reason}"
-                if approve_reason:
-                    withdraw_reason += f"（批准备注：{approve_reason}）"
-                self.withdraw_from_savings(amount, withdraw_reason, operator_id)
-                return (True, amount, reason, w.get("source_info", {}))
-        return (False, 0, "申请不存在或已处理", {})
-
-    def reject_withdrawal(self, application_id: str, reject_reason: str = "", operator_id: str = "") -> tuple:
-        """拒绝取款申请，返回 (成功, 金额, 原因, 来源信息)"""
-        for w in self.data.get("pending_withdrawals", []):
-            if w.get("id") == application_id and w.get("status") == "pending":
-                w["status"] = "rejected"
-                w["reject_reason"] = reject_reason
-                self._save_data()
-                return (True, w.get("amount", 0), w.get("reason", ""), w.get("source_info", {}))
-        return (False, 0, "申请不存在或已处理", {})
-
-    def ignore_withdrawal(self, application_id: str) -> tuple:
-        """忽略取款申请（静默移除），返回 (成功, 金额, 原因)"""
-        pending = self.data.get("pending_withdrawals", [])
-        for i, w in enumerate(pending):
-            if w.get("id") == application_id and w.get("status") == "pending":
-                amount = w.get("amount", 0)
-                reason = w.get("reason", "")
-                pending.pop(i)
-                self._save_data()
-                return (True, amount, reason)
-        return (False, 0, "申请不存在或已处理")
-
-
-@register("astrbot_plugin_pocketmoney", "柯尔", "给机器人设计的小金库系统和小背包系统，增加一些rp乐趣", "1.8.0")
-# ==================== 版本历史 ====================
-# v1.0 - 基础零花钱：余额管理、入账/出账、记录查询
-# v1.1 - 表扬信/投诉信系统：每日限制、排行榜、随机奖金 
-# v1.2 - 背包系统：共享背包、物品入库/使用
-# v1.3 - 专属背包格子：每个用户独立的礼物存储空间
-# v1.4 - 笔记功能：管理员私密备忘录，仅管理员可查看/追加/删除
-# v1.5 - 数据目录迁移至plugin_data，记录操作窗口source替代operator
-# v1.6 - 存折系统：管理员保管的钱，AI申请取款需审批
-# v1.7 - 代码重构：删除压岁钱系统，合并存折到小金库，移除硬编码提示词
-# v1.8 - 转公开插件：移除个人化内容，笔记改为仅管理员可写
-# ==================================================
+try:
+    from astrbot.api import llm_tool
+    HAS_LLM_TOOL = True
+except ImportError:
+    def llm_tool(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    HAS_LLM_TOOL = False
+
+from .managers.backpack import _name_match
+from .managers import (
+    PocketMoneyManager,
+    BackpackManager,
+    UserIsolationManager,
+    ThankLetterManager,
+    ShopManager,
+    GamesManager,
+    LevelManager,
+    BankManager,
+    AchievementManager,
+    GiftManager,
+    verify_gift,
+)
+
+
+@register("astrbot_plugin_pocketmoney", "晨露", "小金库系统 - 零花钱、超市、小游戏、背包", "2.0.0")
 class PocketMoneyPlugin(Star):
+    """
+    v2.0.0 - 模块化重构 + 去硬编码 + 超市系统 + 小游戏（刮刮乐/炒股）
+    """
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
 
-        # 使用插件数据目录（按AstrBot规则使用插件注册名）
         self.data_dir = os.path.join("data", "plugin_data", "astrbot_plugin_pocketmoney")
-        
-        # 自动数据迁移：从旧目录迁移到新目录
         self._migrate_data_if_needed()
-        
-        initial_balance = self.config.get("initial_balance", 0)
-        max_records = self.config.get("max_records", 100)
-        
-        self.manager = PocketMoneyManager(self.data_dir, initial_balance, max_records)
-        
-        # 表扬信管理器
+
+        # 辅助读取嵌套配置
+        def cfg(key, default=None):
+            """支持 flat key 和 nested object key"""
+            if key in self.config:
+                return self.config[key] if self.config[key] is not None else default
+            for section in self.config.values():
+                if isinstance(section, dict) and key in section:
+                    v = section[key]
+                    return v if v is not None else default
+            return default
+
+        self._cfg = cfg
+
+        # ---------- 初始化管理器 ----------
+        self.manager = PocketMoneyManager(
+            self.data_dir,
+            cfg("initial_balance", 0),
+            cfg("max_records", 100),
+        )
         self.thank_manager = ThankLetterManager(self.data_dir)
-        
-        # 小背包管理器
-        max_shared_slots = self.config.get("max_shared_slots", 10)
-        max_user_slots = self.config.get("max_user_slots", 3)
-        self.backpack_manager = BackpackManager(self.data_dir, max_shared_slots, max_user_slots)
-        
-        # 用户隔离池管理器（黑名单用户的操作进入隔离池）
+        self.backpack_manager = BackpackManager(
+            self.data_dir,
+            cfg("max_shared_slots", 10),
+            cfg("max_user_slots", 3),
+        )
         self.isolation_manager = UserIsolationManager(self.data_dir)
-        
-        # 从配置中加载黑名单用户（与文件中的黑名单合并）
-        config_blacklist = self.config.get("blacklist_users", [])
-        for uid in config_blacklist:
+        self.shop_manager = ShopManager(
+            self.data_dir,
+            cfg("shop_daily_count", 10),
+        )
+        self.games_manager = GamesManager(
+            self.data_dir,
+            {
+                "scratch_ticket_price": cfg("scratch_ticket_price", 3),
+            },
+        )
+        self.level_manager = LevelManager(self.data_dir)
+        self.bank_manager = BankManager(self.data_dir)
+        self.achievement_manager = AchievementManager(self.data_dir)
+        self.gift_manager = GiftManager(self.data_dir)
+
+        # 赠送系统配置
+        self._gift_bot_name = cfg("gift_bot_name", "")
+
+        # 从配置加载黑名单
+        for uid in cfg("blacklist_users", []):
             self.isolation_manager.add_to_blacklist(str(uid), self.manager, self.backpack_manager)
 
-        # 匹配出账标记的正则表达式
-        self.spend_pattern = re.compile(
-            r"\s*\[(?=[^\]]*(?:Spend|花费|支出))[^\]]*\]\s*",
-            re.IGNORECASE | re.DOTALL
-        )
-        self.amount_pattern = re.compile(r"(?:Spend|花费|支出)\s*[:：]\s*(\d+(?:\.\d+)?)")
-        self.reason_pattern = re.compile(r"(?:Reason|原因|用途)\s*[:：]\s*(.+?)(?=\s*[,，\]]|\])")
-        self.reason_fallback_pattern = re.compile(
-            r"(?:Spend|花费|支出)\s*[:：]\s*\d+(?:\.\d+)?\s*[,，]\s*(.+?)(?=\s*\])"
-        )
-        
-        # 匹配背包入库标记: [Store: 物品名, Desc: 描述]
-        self.store_pattern = re.compile(
-            r"\s*\[(?=[^\]]*(?:Store|入库|收纳))[^\]]*\]\s*",
-            re.IGNORECASE | re.DOTALL
-        )
-        self.store_name_pattern = re.compile(r"(?:Store|入库|收纳)\s*[:：]\s*(.+?)(?=\s*[,，])")
-        self.store_desc_pattern = re.compile(r"(?:Desc|描述|说明)\s*[:：]\s*(.+?)(?=\s*\])")
-        
-        # 匹配背包使用标记: [Use: 物品名] - 排除UseGift
-        self.use_pattern = re.compile(
-            r"\s*\[(?=[^\]]*(?:(?<!e)Use(?!Gift)|使用(?!礼物)|用掉))[^\]]*\]\s*",
-            re.IGNORECASE | re.DOTALL
-        )
-        self.use_name_pattern = re.compile(r"(?<!e)(?:Use)(?!Gift)\s*[:：]\s*(.+?)(?=\s*\])|(?:使用)(?!礼物)\s*[:：]\s*(.+?)(?=\s*\])|(?:用掉)\s*[:：]\s*(.+?)(?=\s*\])", re.IGNORECASE)
-        
-        # 匹配礼物入库标记: [Gift: 物品名, From: 送礼人, Desc: 描述]
-        self.gift_pattern = re.compile(
-            r"\s*\[(?=[^\]]*(?:Gift|礼物|收礼))[^\]]*\]\s*",
-            re.IGNORECASE | re.DOTALL
-        )
-        self.gift_name_pattern = re.compile(r"(?:Gift|礼物|收礼)\s*[:：]\s*(.+?)(?=\s*[,\uff0c])")
-        self.gift_from_pattern = re.compile(r"(?:From|来自|送礼人)\s*[:：]\s*(.+?)(?=\s*[,\uff0c])")
-        self.gift_desc_pattern = re.compile(r"(?:Desc|描述|说明)\s*[:：]\s*(.+?)(?=\s*\])")
-        
-        # 匹配使用专属格子物品标记: [UseGift: 物品名]
-        self.use_gift_pattern = re.compile(
-            r"\s*\[(?=[^\]]*(?:UseGift|使用礼物|用礼物))[^\]]*\]\s*",
-            re.IGNORECASE | re.DOTALL
-        )
-        self.use_gift_name_pattern = re.compile(r"(?:UseGift|使用礼物|用礼物)\s*[:：]\s*(.+?)(?=\s*\])")
-        
-        # 匹配退款标记: [Refund: 金额, Reason: 原因]
-        self.refund_pattern = re.compile(
-            r"\s*\[(?=[^\]]*(?:Refund|退款|退钱))[^\]]*\]\s*",
-            re.IGNORECASE | re.DOTALL
-        )
-        self.refund_amount_pattern = re.compile(r"(?:Refund|退款|退钱)\s*[:：]\s*(\d+(?:\.\d+)?)")
-        self.refund_reason_pattern = re.compile(r"(?:Reason|原因|理由)\s*[:：]\s*(.+?)(?=\s*[,，\]]|\])")
-        
-        # 匹配笔记标记: [Note: 内容] 或 [笔记: 内容]
-        self.note_pattern = re.compile(
-            r"\s*\[(?=[^\]]*(?:Note|笔记|备忘|记录))[^\]]*\]\s*",
-            re.IGNORECASE | re.DOTALL
-        )
-        self.note_content_pattern = re.compile(r"(?:Note|笔记|备忘|记录)\s*[:：]\s*(.+?)(?=\s*\])")
-        
-        # 匹配申请取款标记: [ApplyWithdraw: 金额, Reason: 原因]
-        self.apply_withdraw_pattern = re.compile(
-            r"\s*\[(?=[^\]]*(?:ApplyWithdraw|申请取款|取存折))[^\]]*\]\s*",
-            re.IGNORECASE | re.DOTALL
-        )
-        self.apply_withdraw_amount_pattern = re.compile(r"(?:ApplyWithdraw|申请取款|取存折)\s*[:：]\s*(\d+(?:\.\d+)?)")
-        self.apply_withdraw_reason_pattern = re.compile(r"(?:Reason|原因|理由)\s*[:：]\s*(.+?)(?=\s*[,，\]]|\])")
-        self.apply_withdraw_reason_fallback_pattern = re.compile(
-            r"(?:ApplyWithdraw|申请取款|取存折)\s*[:：]\s*\d+(?:\.\d+)?\s*[,，]\s*(.+?)(?=\s*\])"
-        )
-        
-        # 防重复扣费：记录已处理的消息ID
+        # ---------- LLM 工具注册 ----------
+        if HAS_LLM_TOOL:
+            for tool_name in [
+                "pm_sign_in", "pm_view_shop", "pm_buy_item", "pm_view_stocks",
+                "pm_buy_stock", "pm_sell_stock", "pm_check_balance",
+                "pm_play_scratch", "pm_give_to_user", "pm_use_user_item", "pm_gift_item",
+            ]:
+                try:
+                    self.context.activate_llm_tool(tool_name)
+                except Exception:
+                    pass
+
+        # ---------- AI 商品生成配置 ----------
+        self._shop_provider_name = cfg("shop_provider_name", "")
+        self._shop_generate_hour = cfg("shop_generate_hour", 6)
+        self._shop_gen_task = None
+
+        # ---------- 正则表达式 ----------
+        self._compile_patterns()
+
+        # 防重复处理
         self.processed_message_ids = set()
 
-    def _migrate_data_if_needed(self):
-        """从旧数据目录迁移到新目录"""
-        import shutil
-        
-        # 支持多个旧目录（按优先级顺序）
-        old_dirs = [
-            os.path.join("data", "PocketMoney"),  # 最早的目录
-            os.path.join("data", "plugin_data", "PocketMoney"),  # 之前的迁移目录
-        ]
-        
-        # 检查新目录是否已有数据
-        new_files = os.listdir(self.data_dir) if os.path.exists(self.data_dir) else []
-        if new_files:
-            logger.debug("[PocketMoney] 新目录已有数据，跳过迁移")
-            return
-        
-        # 尝试从旧目录迁移
-        for old_data_dir in old_dirs:
-            if os.path.exists(old_data_dir) and os.path.isdir(old_data_dir):
-                old_files = os.listdir(old_data_dir)
-                if old_files:
-                    os.makedirs(self.data_dir, exist_ok=True)
-                    logger.info(f"[PocketMoney] 检测到旧数据目录，开始迁移: {old_data_dir} -> {self.data_dir}")
-                    for filename in old_files:
-                        old_path = os.path.join(old_data_dir, filename)
-                        new_path = os.path.join(self.data_dir, filename)
-                        if os.path.isfile(old_path):
-                            shutil.copy2(old_path, new_path)
-                            logger.info(f"[PocketMoney] 迁移文件: {filename}")
-                    logger.info(f"[PocketMoney] 数据迁移完成，旧目录保留供备份: {old_data_dir}")
-                    return  # 迁移成功后退出
+    # ===============================================================
+    #  工具方法
+    # ===============================================================
+
+    def _admin_name(self) -> str:
+        return self._cfg("admin_name", "管理员")
+
+    def _admin_denied_msg(self) -> str:
+        return self._cfg(
+            "admin_permission_denied_msg",
+            f"只有{self._admin_name()}能操作哦",
+        )
+
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        return event.role == "admin"
+
+    def _parse_amount(self, amount_str: str, allow_zero: bool = False) -> tuple:
+        try:
+            val = float(amount_str)
+            if val < 0 or (val == 0 and not allow_zero):
+                return (False, "金额必须是正数")
+            return (True, val)
+        except ValueError:
+            return (False, "金额格式不正确")
 
     def _get_managers_for_user(self, user_id: str) -> tuple:
-        """
-        获取用户对应的管理器（代理模式核心）
-        返回 (money_manager, backpack_manager, is_isolated)
-        金额体系：黑名单用户与普通用户同进同出（共用真实金库）
-        背包体系：黑名单用户使用隔离池背包（独立）
-        """
         if self.isolation_manager.is_blacklisted(user_id):
             managers = self.isolation_manager.get_isolated_managers(
                 user_id, self.manager, self.backpack_manager
             )
-            # Money: 真实金库（同进同出）, Backpack: 隔离池（独立）
             return self.manager, managers["backpack"], True
         return self.manager, self.backpack_manager, False
 
     def _format_records(self, records: List[Dict[str, Any]], show_type: bool = True) -> str:
-        """格式化记录为字符串"""
         if not records:
             return "暂无"
-        
         lines = []
         for r in records:
             if show_type:
-                type_str = "+" if r["type"] == "income" else "-"
-                lines.append(f"{r['time']}: {type_str}{r['amount']}元 ({r['reason']})")
+                t = "+" if r["type"] == "income" else "-"
+                lines.append(f"{r['time']}: {t}{r['amount']}元 ({r['reason']})")
             else:
                 lines.append(f"{r['time']}: {r['amount']}元 ({r['reason']})")
         return "; ".join(lines)
 
     def _get_weekday_info(self) -> tuple:
-        """获取星期信息，返回 (发薪日周几, 今天周几, 距离天数)"""
-        allowance_day = self.config.get("allowance_day", 1)  # 1=周一, 7=周日
+        allowance_day = self._cfg("allowance_day", 1)
         weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-        
         today = datetime.now()
-        current_weekday = today.weekday()  # 0=周一, 6=周日
-        
-        # 配置是1-7，转换为0-6
+        current_weekday = today.weekday()
         allowance_weekday_idx = (allowance_day - 1) % 7
-        
-        # 计算距离下一个发薪日的天数
         days_until = (allowance_weekday_idx - current_weekday) % 7
-        if days_until == 0:
-            days_until = 0  # 今天就是发薪日
-        
-        return (
-            weekday_names[allowance_weekday_idx],
-            weekday_names[current_weekday],
-            days_until
-        )
+        return (weekday_names[allowance_weekday_idx], weekday_names[current_weekday], days_until)
+
+    def _migrate_data_if_needed(self):
+        import shutil
+        old_dirs = [
+            os.path.join("data", "PocketMoney"),
+            os.path.join("data", "plugin_data", "PocketMoney"),
+        ]
+        new_files = os.listdir(self.data_dir) if os.path.exists(self.data_dir) else []
+        if new_files:
+            return
+        for old_data_dir in old_dirs:
+            if os.path.exists(old_data_dir) and os.path.isdir(old_data_dir):
+                old_files = os.listdir(old_data_dir)
+                if old_files:
+                    os.makedirs(self.data_dir, exist_ok=True)
+                    logger.info(f"[PocketMoney] 数据迁移: {old_data_dir} -> {self.data_dir}")
+                    for filename in old_files:
+                        old_path = os.path.join(old_data_dir, filename)
+                        new_path = os.path.join(self.data_dir, filename)
+                        if os.path.isfile(old_path):
+                            shutil.copy2(old_path, new_path)
+                    return
+
+    def _compile_patterns(self):
+        """编译所有正则表达式"""
+        # 出账
+        self.spend_pattern = re.compile(r"\s*\[(?=[^\]]*(?:Spend|花费|支出))[^\]]*\]\s*", re.IGNORECASE | re.DOTALL)
+        self.amount_pattern = re.compile(r"(?:Spend|花费|支出)\s*[:：]\s*(\d+(?:\.\d+)?)")
+        self.reason_pattern = re.compile(r"(?:Reason|原因|用途)\s*[:：]\s*(.+?)(?=\s*[,，\]]|\])")
+        self.reason_fallback_pattern = re.compile(r"(?:Spend|花费|支出)\s*[:：]\s*\d+(?:\.\d+)?\s*[,，]\s*(.+?)(?=\s*\])")
+        # 入库
+        self.store_pattern = re.compile(r"\s*\[(?=[^\]]*(?:Store|入库|收纳))[^\]]*\]\s*", re.IGNORECASE | re.DOTALL)
+        self.store_name_pattern = re.compile(r"(?:Store|入库|收纳)\s*[:：]\s*(.+?)(?=\s*[,，])")
+        self.store_desc_pattern = re.compile(r"(?:Desc|描述|说明)\s*[:：]\s*(.+?)(?=\s*\])")
+        # 使用
+        self.use_pattern = re.compile(r"\s*\[(?=[^\]]*(?:(?<!e)Use(?!Gift)|使用(?!礼物)|用掉))[^\]]*\]\s*", re.IGNORECASE | re.DOTALL)
+        self.use_name_pattern = re.compile(r"(?<!e)(?:Use)(?!Gift)\s*[:：]\s*(.+?)(?=\s*\])|(?:使用)(?!礼物)\s*[:：]\s*(.+?)(?=\s*\])|(?:用掉)\s*[:：]\s*(.+?)(?=\s*\])", re.IGNORECASE)
+        # 礼物
+        self.gift_pattern = re.compile(r"\s*\[(?=[^\]]*(?:Gift|礼物|收礼))[^\]]*\]\s*", re.IGNORECASE | re.DOTALL)
+        self.gift_name_pattern = re.compile(r"(?:Gift|礼物|收礼)\s*[:：]\s*(.+?)(?=\s*[,\uff0c])")
+        self.gift_from_pattern = re.compile(r"(?:From|来自|送礼人)\s*[:：]\s*(.+?)(?=\s*[,\uff0c])")
+        self.gift_desc_pattern = re.compile(r"(?:Desc|描述|说明)\s*[:：]\s*(.+?)(?=\s*\])")
+        # 使用礼物
+        self.use_gift_pattern = re.compile(r"\s*\[(?=[^\]]*(?:UseGift|使用礼物|用礼物))[^\]]*\]\s*", re.IGNORECASE | re.DOTALL)
+        self.use_gift_name_pattern = re.compile(r"(?:UseGift|使用礼物|用礼物)\s*[:：]\s*(.+?)(?=\s*\])")
+        # 退款
+        self.refund_pattern = re.compile(r"\s*\[(?=[^\]]*(?:Refund|退款|退钱))[^\]]*\]\s*", re.IGNORECASE | re.DOTALL)
+        self.refund_amount_pattern = re.compile(r"(?:Refund|退款|退钱)\s*[:：]\s*(\d+(?:\.\d+)?)")
+        self.refund_reason_pattern = re.compile(r"(?:Reason|原因|理由)\s*[:：]\s*(.+?)(?=\s*[,，\]]|\])")
+        # 笔记
+        self.note_pattern = re.compile(r"\s*\[(?=[^\]]*(?:Note|笔记|备忘|记录))[^\]]*\]\s*", re.IGNORECASE | re.DOTALL)
+        self.note_content_pattern = re.compile(r"(?:Note|笔记|备忘|记录)\s*[:：]\s*(.+?)(?=\s*\])")
+        # 申请取款
+        self.apply_withdraw_pattern = re.compile(r"\s*\[(?=[^\]]*(?:ApplyWithdraw|申请取款|取存折))[^\]]*\]\s*", re.IGNORECASE | re.DOTALL)
+        self.apply_withdraw_amount_pattern = re.compile(r"(?:ApplyWithdraw|申请取款|取存折)\s*[:：]\s*(\d+(?:\.\d+)?)")
+        self.apply_withdraw_reason_pattern = re.compile(r"(?:Reason|原因|理由)\s*[:：]\s*(.+?)(?=\s*[,，\]]|\])")
+        self.apply_withdraw_reason_fallback_pattern = re.compile(r"(?:ApplyWithdraw|申请取款|取存折)\s*[:：]\s*\d+(?:\.\d+)?\s*[,，]\s*(.+?)(?=\s*\])")
+
+    # ===============================================================
+    #  LLM 钩子
+    # ===============================================================
 
     @filter.on_llm_request()
     async def add_context_prompt(self, event: AstrMessageEvent, req: ProviderRequest):
         """向LLM注入小金库状态"""
-        # 获取当前用户ID
         current_user_id = event.get_sender_id()
         current_user_name = event.get_sender_name() or current_user_id
-        
-        # 使用代理模式获取正确的管理器（真实或隔离）
         money_mgr, backpack_mgr, is_isolated = self._get_managers_for_user(current_user_id)
-        
+
         if is_isolated:
-            logger.debug(f"[PocketMoney] 黑名单用户 {current_user_id} 使用隔离池数据（同进同出）")
-            # 处理到期的隔离池静默退款
             self.isolation_manager.process_pending_refunds(money_mgr)
-        
-        # money_mgr 始终是真实金库（黑名单用户同进同出）
-        income_count = self.config.get("income_record_count", 2)
-        expense_count = self.config.get("expense_record_count", 5)
+
+        income_count = self._cfg("income_record_count", 2)
+        expense_count = self._cfg("expense_record_count", 5)
         income_records = money_mgr.get_recent_income_records(income_count)
-        
+
         if is_isolated:
-            # 黑名单用户：看到全部出账记录，但屏蔽非自己触发的理由
             expense_records = money_mgr.get_recent_expense_records(expense_count)
             expense_records = [
                 {**r, "reason": "出账"} if r.get("operator_id") != current_user_id else r
@@ -1298,126 +259,86 @@ class PocketMoneyPlugin(Star):
             balance = money_mgr.get_balance()
             today_expense = money_mgr.get_today_expense()
         else:
-            # 普通用户：过滤 isolation 标记的出账记录，补偿余额
             all_expense = [r for r in money_mgr.data.get("records", [])
                            if r["type"] == "expense" and not r.get("isolation")]
             expense_records = all_expense[-expense_count:] if all_expense else []
-            # 余额补偿：加回待退款金额，让普通用户看到不受隔离影响的余额
             pending_total = sum(r.get("amount", 0) for r in self.isolation_manager.pending_refunds)
             balance = round(money_mgr.get_balance() + pending_total, 2)
-            # 今日花销排除 isolation 出账
             today = datetime.now().strftime("%Y-%m-%d")
             today_expense = sum(
                 r["amount"] for r in money_mgr.data.get("records", [])
                 if r["type"] == "expense" and not r.get("isolation") and r["time"].startswith(today)
             )
-        
-        # 背包信息
+
         shared_items = backpack_mgr.format_shared_items_for_prompt()
         shared_slots = f"{backpack_mgr.get_shared_item_count()}/{backpack_mgr.max_shared_slots}"
         user_items = backpack_mgr.format_user_items_for_prompt(current_user_id)
         user_slots = f"{backpack_mgr.get_user_item_count(current_user_id)}/{backpack_mgr.max_user_slots}"
-        
-        # 存折信息（黑名单用户看到隔离池存折，实际上永远是0）
+
         if is_isolated:
-            savings_balance = 0  # 隔离用户没有存折功能
+            savings_balance = 0
             pending_count = 0
         else:
             savings_balance = self.manager.get_savings_balance()
             pending_count = len(self.manager.get_pending_withdrawals())
-        
+
         income_str = self._format_records(income_records, show_type=False)
         expense_str = self._format_records(expense_records, show_type=False)
-        
-        # 获取星期信息
         allowance_weekday, today_weekday, days_until = self._get_weekday_info()
-        
-        # 获取今日表扬奖金
         today_thank_bonus = self.thank_manager.get_today_bonus()
-        
-        # 获取小金库笔记（黑名单用户使用隔离池笔记）
         note = money_mgr.get_note()
-
-        # 构建存折待审批信息
         pending_info = f"（有{pending_count}个待审批申请）" if pending_count > 0 else ""
-        
-        # 构建小金库+存折系统提示词（v1.7合并版）
-        pocketmoney_template = self.config.get("pocketmoney_prompt", "")
-        note_str = f"\n【我的笔记】{note}" if note else ""
-        
+        admin_name = self._admin_name()
+
+        pocketmoney_template = self._cfg("pocketmoney_prompt", "")
         pocketmoney_prompt = pocketmoney_template.format(
-            balance=balance,
-            savings_balance=savings_balance,
-            pending_info=pending_info,
-            unit="元",
-            allowance_weekday=allowance_weekday,
-            today_weekday=today_weekday,
-            days_until=days_until,
-            income_records=income_str,
-            expense_records=expense_str,
-            today_thank_bonus=today_thank_bonus,
-            today_expense=today_expense
+            balance=balance, savings_balance=savings_balance,
+            pending_info=pending_info, unit="元",
+            allowance_weekday=allowance_weekday, today_weekday=today_weekday,
+            days_until=days_until, income_records=income_str,
+            expense_records=expense_str, today_thank_bonus=today_thank_bonus,
+            today_expense=today_expense, admin_name=admin_name,
         )
-        
-        # 将笔记插入到 </小金库系统> 标签之前
+        note_str = f"\n【我的笔记】{note}" if note else ""
         if note_str and "</小金库系统>" in pocketmoney_prompt:
             pocketmoney_prompt = pocketmoney_prompt.replace("</小金库系统>", f"{note_str}\n</小金库系统>")
-        
-        # 构建小背包系统提示词
-        backpack_template = self.config.get("backpack_prompt", "")
+
+        backpack_template = self._cfg("backpack_prompt", "")
         backpack_prompt = backpack_template.format(
-            shared_slots=shared_slots,
-            shared_items=shared_items,
-            user_name=current_user_name,
-            user_slots=user_slots,
-            user_items=user_items
+            shared_slots=shared_slots, shared_items=shared_items,
+            user_name=current_user_name, user_slots=user_slots,
+            user_items=user_items,
         )
 
         req.system_prompt += f"\n{pocketmoney_prompt}"
         req.system_prompt += f"\n{backpack_prompt}"
-        
-        logger.debug(f"[PocketMoney] 注入上下文 - 余额: {balance}元, 存折: {savings_balance}元, 今天: {today_weekday}, 共享背包: {shared_slots}, 用户专属: {user_slots}")
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
-        """处理LLM响应，解析并处理出账、入库、使用标记"""
+        """处理LLM响应中的标记"""
         original_text = resp.completion_text
         cleaned_text = original_text
 
-        logger.debug("[PocketMoney] on_llm_resp 被调用")
-        logger.debug(f"[PocketMoney] 原始文本长度: {len(original_text)}")
-        
-        # 防重复处理：使用消息ID + 响应文本哈希作为唯一标识
         message_id = getattr(event, 'message_id', None) or id(event)
         response_hash = hash(original_text[:100]) if original_text else 0
         unique_key = f"{message_id}_{response_hash}"
-        
         if unique_key in self.processed_message_ids:
-            logger.debug(f"[PocketMoney] 跳过重复处理: {unique_key}")
             return
-        
         self.processed_message_ids.add(unique_key)
         if len(self.processed_message_ids) > 1000:
             self.processed_message_ids = set(list(self.processed_message_ids)[-500:])
 
         current_user_id = event.get_sender_id()
         current_user_name = event.get_sender_name() or current_user_id
-        
-        # 使用代理模式获取正确的管理器（真实或隔离）
         money_mgr, backpack_mgr, is_isolated = self._get_managers_for_user(current_user_id)
-        if is_isolated:
-            logger.debug(f"[PocketMoney] 黑名单用户 {current_user_id} 的操作将进入隔离池")
         log_prefix = "[隔离池] " if is_isolated else ""
 
-        # 处理出账标记
+        # --- 出账 ---
         spend_matches = list(self.spend_pattern.finditer(cleaned_text))
         if spend_matches:
-            logger.debug(f"[PocketMoney] 找到 {len(spend_matches)} 个出账标记")
             cleaned_text = self.spend_pattern.sub('', cleaned_text).strip()
-            
             spend_block = spend_matches[-1].group(0)
             amount_match = self.amount_pattern.search(spend_block)
-            
             if amount_match:
                 try:
                     amount = float(amount_match.group(1))
@@ -1425,210 +346,138 @@ class PocketMoneyPlugin(Star):
                     if reason_match:
                         reason = reason_match.group(1).strip()
                     else:
-                        fallback_match = self.reason_fallback_pattern.search(spend_block)
-                        reason = fallback_match.group(1).strip() if fallback_match else "未说明原因"
-                    
+                        fb = self.reason_fallback_pattern.search(spend_block)
+                        reason = fb.group(1).strip() if fb else "未说明原因"
                     current_balance = money_mgr.get_balance()
                     if amount <= current_balance:
                         if money_mgr.add_expense(amount, reason, current_user_id, isolation=is_isolated):
-                            logger.info(f"[PocketMoney] {log_prefix}出账成功: {amount} - {reason}")
+                            logger.info(f"[PocketMoney] {log_prefix}出账: {amount} - {reason}")
                             if is_isolated:
-                                # 隔离池出账：2小时后静默退款
                                 self.isolation_manager.add_pending_refund(amount, reason, current_user_id)
                     else:
-                        # 保底策略：余额不足时，扣除全部余额并记录
                         if current_balance > 0:
-                            fallback_reason = f"{reason}（原请求{amount}元，余额不足，已扣除全部）"
-                            money_mgr.add_expense(current_balance, fallback_reason, current_user_id, isolation=is_isolated)
-                            logger.info(f"[PocketMoney] {log_prefix}保底出账: {current_balance}/{amount} - {reason}")
+                            fb_reason = f"{reason}（原请求{amount}元，余额不足，扣除全部）"
+                            money_mgr.add_expense(current_balance, fb_reason, current_user_id, isolation=is_isolated)
                             if is_isolated:
-                                # 隔离池保底出账：2小时后静默退款
-                                self.isolation_manager.add_pending_refund(current_balance, fallback_reason, current_user_id)
-                        else:
-                            logger.warning(f"[PocketMoney] {log_prefix}余额为0，无法扣款: {amount} - {reason}")
+                                self.isolation_manager.add_pending_refund(current_balance, fb_reason, current_user_id)
                 except ValueError:
-                    logger.warning("[PocketMoney] 金额解析失败")
+                    pass
 
-        # 处理背包入库标记
+        # --- 入库 ---
         store_matches = list(self.store_pattern.finditer(cleaned_text))
         if store_matches:
-            logger.debug(f"[PocketMoney] 找到 {len(store_matches)} 个入库标记")
             cleaned_text = self.store_pattern.sub('', cleaned_text).strip()
-            
             store_block = store_matches[-1].group(0)
             name_match = self.store_name_pattern.search(store_block)
             desc_match = self.store_desc_pattern.search(store_block)
-            
             if name_match:
                 item_name = name_match.group(1).strip()
                 item_desc = desc_match.group(1).strip() if desc_match else "无描述"
-                
                 if backpack_mgr.add_shared_item(item_name, item_desc):
-                    logger.info(f"[PocketMoney] {log_prefix}入库成功: {item_name} - {item_desc}")
+                    logger.info(f"[PocketMoney] {log_prefix}入库: {item_name}")
                     if not is_isolated:
                         self.isolation_manager.sync_store_to_shared(item_name, item_desc, self.backpack_manager)
-                else:
-                    logger.warning(f"[PocketMoney] 入库失败（背包已满）: {item_name}")
 
-        # 【重要】先处理UseGift，再处理Use，避免Use误匹配UseGift
+        # --- 使用礼物（先于Use处理） ---
         use_gift_matches = list(self.use_gift_pattern.finditer(cleaned_text))
         if use_gift_matches:
-            logger.debug(f"[PocketMoney] 找到 {len(use_gift_matches)} 个使用礼物标记")
             cleaned_text = self.use_gift_pattern.sub('', cleaned_text).strip()
-            
-            for use_gift_block_match in use_gift_matches:
-                use_gift_block = use_gift_block_match.group(0)
-                use_gift_name_match = self.use_gift_name_pattern.search(use_gift_block)
-                
-                if use_gift_name_match:
-                    gift_name = use_gift_name_match.group(1).strip()
-                    if backpack_mgr.use_user_item(current_user_id, gift_name):
-                        logger.info(f"[PocketMoney] {log_prefix}使用礼物成功: {gift_name}")
-                    else:
-                        logger.warning(f"[PocketMoney] 使用礼物失败（物品不存在）: {gift_name}")
+            for m in use_gift_matches:
+                nm = self.use_gift_name_pattern.search(m.group(0))
+                if nm:
+                    backpack_mgr.use_user_item(current_user_id, nm.group(1).strip())
 
-        # 处理共享背包使用标记: [Use: 物品名]
+        # --- 使用共享背包物品 ---
         use_matches = list(self.use_pattern.finditer(cleaned_text))
         if use_matches:
-            logger.debug(f"[PocketMoney] 找到 {len(use_matches)} 个共享背包使用标记")
             cleaned_text = self.use_pattern.sub('', cleaned_text).strip()
-            
-            for use_block_match in use_matches:
-                use_block = use_block_match.group(0)
-                use_name_match = self.use_name_pattern.search(use_block)
-                
-                if use_name_match:
-                    item_name = next((g.strip() for g in use_name_match.groups() if g), None)
+            for m in use_matches:
+                nm = self.use_name_pattern.search(m.group(0))
+                if nm:
+                    item_name = next((g.strip() for g in nm.groups() if g), None)
                     if item_name:
                         if backpack_mgr.use_shared_item(item_name):
-                            logger.info(f"[PocketMoney] {log_prefix}共享背包使用成功: {item_name}")
                             if not is_isolated:
                                 self.isolation_manager.sync_use_to_shared(item_name, self.backpack_manager)
-                        else:
-                            logger.warning(f"[PocketMoney] 共享背包使用失败（物品不存在）: {item_name}")
 
-        # 处理礼物入库标记: [Gift: 物品名, From: 送礼人, Desc: 描述]
+        # --- 礼物入库 ---
         gift_matches = list(self.gift_pattern.finditer(cleaned_text))
         if gift_matches:
-            logger.debug(f"[PocketMoney] 找到 {len(gift_matches)} 个礼物入库标记")
             cleaned_text = self.gift_pattern.sub('', cleaned_text).strip()
-            
-            for gift_block_match in gift_matches:
-                gift_block = gift_block_match.group(0)
-                gift_name_match = self.gift_name_pattern.search(gift_block)
-                gift_from_match = self.gift_from_pattern.search(gift_block)
-                gift_desc_match = self.gift_desc_pattern.search(gift_block)
-                
-                if gift_name_match:
-                    gift_name = gift_name_match.group(1).strip()
-                    gift_from = gift_from_match.group(1).strip() if gift_from_match else current_user_name
-                    gift_desc = gift_desc_match.group(1).strip() if gift_desc_match else "无描述"
-                    
-                    if backpack_mgr.add_user_gift(current_user_id, gift_name, gift_desc, gift_from):
-                        logger.info(f"[PocketMoney] {log_prefix}礼物入库成功: {gift_name} (来自{gift_from})")
-                    else:
-                        logger.warning(f"[PocketMoney] 礼物入库失败（专属格子已满）: {gift_name}")
+            for gm in gift_matches:
+                block = gm.group(0)
+                gn = self.gift_name_pattern.search(block)
+                if gn:
+                    gift_name = gn.group(1).strip()
+                    gf = self.gift_from_pattern.search(block)
+                    gd = self.gift_desc_pattern.search(block)
+                    gift_from = gf.group(1).strip() if gf else current_user_name
+                    gift_desc = gd.group(1).strip() if gd else "无描述"
+                    backpack_mgr.add_user_gift(current_user_id, gift_name, gift_desc, gift_from)
 
-        # 处理退款标记: [Refund: 金额, Reason: 原因]
+        # --- 退款 ---
         refund_matches = list(self.refund_pattern.finditer(cleaned_text))
         if refund_matches:
-            logger.debug(f"[PocketMoney] 找到 {len(refund_matches)} 个退款标记")
             cleaned_text = self.refund_pattern.sub('', cleaned_text).strip()
-            
-            refund_block = refund_matches[-1].group(0)
-            refund_amount_match = self.refund_amount_pattern.search(refund_block)
-            
-            if refund_amount_match:
+            block = refund_matches[-1].group(0)
+            am = self.refund_amount_pattern.search(block)
+            if am:
                 try:
-                    refund_amount = float(refund_amount_match.group(1))
-                    refund_reason_match = self.refund_reason_pattern.search(refund_block)
-                    refund_reason = refund_reason_match.group(1).strip() if refund_reason_match else "退款"
-                    
+                    refund_amount = float(am.group(1))
+                    rm = self.refund_reason_pattern.search(block)
+                    refund_reason = rm.group(1).strip() if rm else "退款"
                     if refund_amount > 0:
-                        refund_full_reason = f"退款：{refund_reason}"
-                        if money_mgr.add_income(refund_amount, refund_full_reason, current_user_id):
-                            logger.info(f"[PocketMoney] {log_prefix}退款成功: +{refund_amount} - {refund_reason}")
+                        money_mgr.add_income(refund_amount, f"退款：{refund_reason}", current_user_id)
                 except ValueError:
-                    logger.warning("[PocketMoney] 退款金额解析失败")
+                    pass
 
-        # 处理笔记标记（AI不可写笔记，仅清除标记不做任何处理）
-        note_matches = list(self.note_pattern.finditer(cleaned_text))
-        if note_matches:
+        # --- 笔记（清除标记，不自动追加） ---
+        if self.note_pattern.search(cleaned_text):
             cleaned_text = self.note_pattern.sub('', cleaned_text).strip()
 
-        # 处理申请取款标记: [ApplyWithdraw: 金额, Reason: 原因]
-        apply_withdraw_matches = list(self.apply_withdraw_pattern.finditer(cleaned_text))
-        if apply_withdraw_matches:
-            logger.debug(f"[PocketMoney] 找到 {len(apply_withdraw_matches)} 个申请取款标记")
+        # --- 申请取款 ---
+        aw_matches = list(self.apply_withdraw_pattern.finditer(cleaned_text))
+        if aw_matches:
             cleaned_text = self.apply_withdraw_pattern.sub('', cleaned_text).strip()
-            
-            apply_block = apply_withdraw_matches[-1].group(0)
-            amount_match = self.apply_withdraw_amount_pattern.search(apply_block)
-            
-            if amount_match:
+            block = aw_matches[-1].group(0)
+            am = self.apply_withdraw_amount_pattern.search(block)
+            if am:
                 try:
-                    amount = float(amount_match.group(1))
-                    reason_match = self.apply_withdraw_reason_pattern.search(apply_block)
-                    if reason_match:
-                        reason = reason_match.group(1).strip()
+                    amount = float(am.group(1))
+                    rm = self.apply_withdraw_reason_pattern.search(block)
+                    if rm:
+                        reason = rm.group(1).strip()
                     else:
-                        fallback_match = self.apply_withdraw_reason_fallback_pattern.search(apply_block)
-                        reason = fallback_match.group(1).strip() if fallback_match else "未说明原因"
-                    
+                        fb = self.apply_withdraw_reason_fallback_pattern.search(block)
+                        reason = fb.group(1).strip() if fb else "未说明原因"
                     if is_isolated:
-                        logger.info(f"[PocketMoney] [隔离池] 申请取款被静默处理: {amount}元 - {reason}")
+                        pass  # 静默忽略
                     else:
                         savings_balance = self.manager.get_savings_balance()
                         if amount <= savings_balance:
                             group_id = event.get_group_id()
-                            source_info = {
-                                "group_id": group_id,
-                                "is_group": bool(group_id),
-                                "user_id": current_user_id
-                            }
+                            source_info = {"group_id": group_id, "is_group": bool(group_id), "user_id": current_user_id}
                             application_id = self.manager.apply_withdrawal(amount, reason, source_info)
                             if application_id:
-                                logger.info(f"[PocketMoney] 申请取款成功: {amount}元 - {reason} (申请ID: {application_id})")
-                                admin_qq = self.config.get("admin_qq", "")
+                                admin_qq = self._cfg("admin_qq", "")
                                 try:
-                                    notify_msg = (
-                                        f"📋 存折取款申请\n"
-                                        f"申请ID：{application_id}\n"
-                                        f"申请人QQ：{current_user_id}\n"
-                                        f"金额：{amount}元\n"
-                                        f"原因：{reason}\n"
+                                    notify = (
+                                        f"📋 存折取款申请\n申请ID：{application_id}\n"
+                                        f"金额：{amount}元\n原因：{reason}\n"
                                         f"存折余额：{savings_balance}元\n"
-                                        f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                                        f"回复「批准取款 {application_id}」或「批准取款 {application_id} 原因」批准\n"
-                                        f"回复「拒绝取款 {application_id} 原因」拒绝"
+                                        f"回复「批准取款 {application_id}」批准"
                                     )
-                                    await event.bot.send_private_msg(user_id=int(admin_qq), message=notify_msg)
+                                    await event.bot.send_private_msg(user_id=int(admin_qq), message=notify)
                                 except Exception as e:
                                     logger.warning(f"[PocketMoney] 通知管理员失败: {e}")
-                        else:
-                            logger.warning(f"[PocketMoney] 存折余额不足: 需要 {amount}，当前 {savings_balance}")
                 except ValueError:
-                    logger.warning("[PocketMoney] 申请取款金额解析失败")
+                    pass
 
         resp.completion_text = cleaned_text
 
-    # ------------------- 管理员命令 -------------------
-
-    def _is_admin(self, event: AstrMessageEvent) -> bool:
-        return event.role == "admin"
-    
-    def _admin_denied_msg(self):
-        return self.config.get("admin_permission_denied_msg", "这是和管理员之间的秘密，不能告诉你哦")
-    
-    def _parse_amount(self, amount_str: str, allow_zero: bool = False) -> tuple:
-        """解析金额，返回 (成功, 金额或错误信息)"""
-        try:
-            val = float(amount_str)
-            if val < 0 or (val == 0 and not allow_zero):
-                return (False, "金额必须是正数")
-            return (True, val)
-        except ValueError:
-            return (False, "金额格式不正确")
+    # ===============================================================
+    #  管理员：零花钱命令
+    # ===============================================================
 
     @filter.command("发零花钱")
     async def admin_add_income(self, event: AstrMessageEvent, amount: str, *, reason: str = "零花钱"):
@@ -1668,7 +517,6 @@ class PocketMoneyPlugin(Star):
         if not self._is_admin(event):
             yield event.plain_result(self._admin_denied_msg()); return
         count = max(1, int(num)) if num.isdigit() else 5
-        # 过滤隔离池记录，补偿余额
         all_records = [r for r in self.manager.get_all_records() if not r.get("isolation")]
         records = all_records[-count:] if all_records else []
         pending_total = sum(r.get("amount", 0) for r in self.isolation_manager.pending_refunds)
@@ -1687,7 +535,6 @@ class PocketMoneyPlugin(Star):
         if not self._is_admin(event):
             yield event.plain_result(self._admin_denied_msg()); return
         limit = max(1, int(num)) if num.isdigit() else 20
-        # 过滤隔离池记录
         all_records = [r for r in self.manager.get_all_records() if not r.get("isolation")]
         if not all_records:
             yield event.plain_result("暂无交易记录。"); return
@@ -1696,11 +543,12 @@ class PocketMoneyPlugin(Star):
         total_income, total_expense = 0, 0
         for r in reversed(records):
             t = "+" if r["type"] == "income" else "-"
-            operator_id = r.get("operator_id", "")
-            operator_str = f" | @{operator_id}" if operator_id else ""
-            response += f"{r['time']} | {t}{r['amount']}元 | {r['reason']}{operator_str}\n"
-            if r["type"] == "income": total_income += r["amount"]
-            else: total_expense += r["amount"]
+            op = f" | @{r.get('operator_id', '')}" if r.get('operator_id') else ""
+            response += f"{r['time']} | {t}{r['amount']}元 | {r['reason']}{op}\n"
+            if r["type"] == "income":
+                total_income += r["amount"]
+            else:
+                total_expense += r["amount"]
         response += f"\n📊 统计：入账 +{total_income}元，出账 -{total_expense}元"
         yield event.plain_result(response)
 
@@ -1721,25 +569,23 @@ class PocketMoneyPlugin(Star):
         else:
             yield event.plain_result(f"📅 发零花钱日：{wd}\n今天：{today}\n还有 {days} 天")
 
-    # ------------------- 表扬信和投诉信命令 -------------------
+    # ===============================================================
+    #  表扬信 / 投诉信
+    # ===============================================================
 
     async def _process_thank_letter(self, event: AstrMessageEvent):
-        """处理表扬信的核心逻辑，返回结果消息字符串，失败返回 None"""
         uid, name = event.get_sender_id(), event.get_sender_name() or event.get_sender_id()
         money_mgr, _, is_isolated = self._get_managers_for_user(uid)
-        log_prefix = "[隔离池] " if is_isolated else ""
-
         if not self.thank_manager.can_send_today(uid):
             return None, "你今天已经发过表扬信啦，明天再来吧"
         amount = random.randint(
-            self.config.get("thank_letter_min_amount", 1),
-            self.config.get("thank_letter_max_amount", 10)
+            self._cfg("thank_letter_min_amount", 1),
+            self._cfg("thank_letter_max_amount", 10),
         )
         if not self.thank_manager.record_thank_letter(uid, name, amount):
             return None, "发送失败了，请稍后再试..."
         money_mgr.data["balance"] = round(money_mgr.get_balance() + amount, 2)
         money_mgr._save_data()
-        logger.info(f"[PocketMoney] {log_prefix}表扬信奖金: +{amount}元")
         msg = (
             f"收到 {name} 的表扬信！\n"
             f"🎉 获得表扬奖金：+{amount}元\n"
@@ -1755,10 +601,8 @@ class PocketMoneyPlugin(Star):
 
     @filter.regex(r"统一发表扬信")
     async def send_thank_letter_broadcast(self, event: AstrMessageEvent):
-        """统一发表扬信：群里所有机器人都能收到，无需指令前缀"""
         amount, msg = await self._process_thank_letter(event)
         if amount is None:
-            # 今天已发过或失败时静默忽略，避免多个机器人同时报错刷屏
             return
         yield event.plain_result(msg)
 
@@ -1769,9 +613,10 @@ class PocketMoneyPlugin(Star):
         src = f"群{event.get_group_id()}" if event.get_group_id() else "私聊"
         msg = f"📮 投诉信！\n来源：{src}\n投诉人：{name}({uid})\n理由：{reason}"
         try:
-            await event.bot.send_private_msg(user_id=int(self.config.get("admin_qq", "")), message=msg)
-            yield event.plain_result("投诉信已转交给管理员")
-        except: yield event.plain_result(f"投诉已记录：{reason}")
+            await event.bot.send_private_msg(user_id=int(self._cfg("admin_qq", "")), message=msg)
+            yield event.plain_result(f"投诉信已转交给{self._admin_name()}")
+        except Exception:
+            yield event.plain_result(f"投诉已记录：{reason}")
 
     @filter.command("表扬信排行")
     async def thank_letter_ranking(self, event: AstrMessageEvent, num: str = "10"):
@@ -1783,129 +628,90 @@ class PocketMoneyPlugin(Star):
         lines = [f"💌 表扬信排行榜（TOP {len(ranking)}）：\n"]
         for i, (key, count) in enumerate(ranking, 1):
             name = key.split("|", 1)[-1]
-            m = medals[i-1] if i <= 3 else f"{i}."
+            m = medals[i - 1] if i <= 3 else f"{i}."
             lines.append(f"{m} {name}：{count} 封")
         lines.append(f"\n📊 累计奖金：{self.thank_manager.get_total_bonus()}元")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("今日表扬")
     async def today_thank_bonus(self, event: AstrMessageEvent):
-        yield event.plain_result(f"💌 本日：{self.thank_manager.get_today_bonus()}元\n📊 累计：{self.thank_manager.get_total_bonus()}元")
+        yield event.plain_result(
+            f"💌 本日：{self.thank_manager.get_today_bonus()}元\n"
+            f"📊 累计：{self.thank_manager.get_total_bonus()}元"
+        )
 
-    # ------------------- 小背包命令 -------------------
+    # ===============================================================
+    #  背包命令
+    # ===============================================================
 
     @filter.command("我的格子")
     async def my_slots(self, event: AstrMessageEvent):
-        """(用户) 查看自己的专属格子"""
         user_id = event.get_sender_id()
         user_name = event.get_sender_name() or user_id
-        # 使用代理管理器（黑名单用户看隔离池数据）
         _, backpack_mgr, _ = self._get_managers_for_user(user_id)
-        
         items = backpack_mgr.get_user_items(user_id)
         slots = f"{backpack_mgr.get_user_item_count(user_id)}/{backpack_mgr.max_user_slots}"
-        
         if not items:
-            yield event.plain_result(f"🎁 {user_name}，你在bot这里的专属格子（{slots}）：空空如也")
-            return
-        
-        response = f"🎁 {user_name}，你在bot这里的专属格子（{slots}）：\n\n"
+            yield event.plain_result(f"🎁 {user_name}，你的专属格子（{slots}）：空空如也"); return
+        response = f"🎁 {user_name}，你的专属格子（{slots}）：\n\n"
         for i, item in enumerate(items, 1):
-            response += f"{i}. **{item['name']}**\n"
-            response += f"   🎁 来自：{item.get('from', '未知')}\n"
-            response += f"   📝 {item['description']}\n"
-            response += f"   ⏰ {item['time']}\n\n"
-        
+            expiry = f"\n   ⏰ 保质期至 {item['expires_at'][:10]}" if item.get("expires_at") else ""
+            response += f"{i}. {item['name']}\n   🎁 来自：{item.get('from', '未知')}\n   📝 {item['description']}{expiry}\n\n"
         yield event.plain_result(response)
 
     @filter.command("查看背包")
     async def view_backpack(self, event: AstrMessageEvent):
-        """(管理员) 查看共享背包"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "这是AI的私人背包，不能随便看哦"))
-            return
-        
+            yield event.plain_result(self._admin_denied_msg()); return
         items = self.backpack_manager.get_shared_items()
         slots = f"{self.backpack_manager.get_shared_item_count()}/{self.backpack_manager.max_shared_slots}"
-        
         if not items:
-            yield event.plain_result(f"🎒 共享背包（{slots}）：空空如也~")
-            return
-        
+            yield event.plain_result(f"🎒 共享背包（{slots}）：空空如也~"); return
         response = f"🎒 共享背包（{slots}）：\n\n"
         for i, item in enumerate(items, 1):
-            response += f"{i}. **{item['name']}**\n"
-            response += f"   📝 {item['description']}\n"
-            response += f"   ⏰ {item['time']}\n\n"
-        
+            expiry = f"\n   ⏰ 保质期至 {item['expires_at'][:10]}" if item.get("expires_at") else ""
+            response += f"{i}. {item['name']}\n   📝 {item['description']}\n   🕐 {item['time']}{expiry}\n\n"
         yield event.plain_result(response)
 
     @filter.command("查看专属格子")
     async def view_user_slots(self, event: AstrMessageEvent, user_id: str = ""):
-        """(管理员) 查看指定用户的专属格子，不指定则查看所有"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能操作"))
-            return
-        
+            yield event.plain_result(self._admin_denied_msg()); return
         if user_id.strip():
-            # 查看指定用户的专属格子
             user_id = user_id.strip()
             items = self.backpack_manager.get_user_items(user_id)
             slots = f"{self.backpack_manager.get_user_item_count(user_id)}/{self.backpack_manager.max_user_slots}"
-            
             if not items:
-                yield event.plain_result(f"🎁 用户 {user_id} 的专属格子（{slots}）：空空如也~")
-                return
-            
+                yield event.plain_result(f"🎁 用户 {user_id} 的专属格子（{slots}）：空空如也~"); return
             response = f"🎁 用户 {user_id} 的专属格子（{slots}）：\n\n"
             for i, item in enumerate(items, 1):
-                response += f"{i}. **{item['name']}**\n"
-                response += f"   🎁 来自：{item.get('from', '未知')}\n"
-                response += f"   📝 {item['description']}\n"
-                response += f"   ⏰ {item['time']}\n\n"
-            
+                response += f"{i}. {item['name']}\n   🎁 来自：{item.get('from', '未知')}\n   📝 {item['description']}\n\n"
             yield event.plain_result(response)
         else:
-            # 查看所有用户的专属格子
             all_slots = self.backpack_manager.get_all_user_slots()
-            
             if not all_slots:
-                yield event.plain_result("🎁 还没有任何用户有专属格子物品")
-                return
-            
+                yield event.plain_result("🎁 还没有任何用户有专属格子物品"); return
             response = "🎁 所有用户的专属格子：\n\n"
             for uid, items in all_slots.items():
                 if items:
-                    slots = f"{len(items)}/{self.backpack_manager.max_user_slots}"
-                    response += f"用户 {uid}（{slots}）：\n"
+                    response += f"用户 {uid}（{len(items)}/{self.backpack_manager.max_user_slots}）：\n"
                     for item in items:
                         response += f"  - {item['name']} (来自{item.get('from', '未知')})\n"
                     response += "\n"
-            
             yield event.plain_result(response)
 
     @filter.command("清空背包")
     async def clear_backpack(self, event: AstrMessageEvent):
-        """(管理员) 清空共享背包"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能操作"))
-            return
-        
+            yield event.plain_result(self._admin_denied_msg()); return
         count = self.backpack_manager.get_shared_item_count()
         self.backpack_manager.clear_shared_items()
         yield event.plain_result(f"已清空共享背包，移除了 {count} 件物品")
 
     @filter.command("清空专属格子")
     async def clear_user_slots(self, event: AstrMessageEvent, user_id: str):
-        """(管理员) 清空指定用户的专属格子"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能操作"))
-            return
-        
+            yield event.plain_result(self._admin_denied_msg()); return
         user_id = user_id.strip()
         count = self.backpack_manager.get_user_item_count(user_id)
         self.backpack_manager.clear_user_items(user_id)
@@ -1913,16 +719,10 @@ class PocketMoneyPlugin(Star):
 
     @filter.command("背包移除")
     async def remove_from_backpack(self, event: AstrMessageEvent, *, item_name: str = ""):
-        """(管理员) 从共享背包移除指定物品"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能操作"))
-            return
-        
+            yield event.plain_result(self._admin_denied_msg()); return
         if not item_name.strip():
-            yield event.plain_result("请指定要移除的物品名称")
-            return
-        
+            yield event.plain_result("请指定要移除的物品名称"); return
         if self.backpack_manager.use_shared_item(item_name.strip()):
             yield event.plain_result(f"已从共享背包移除：{item_name}")
         else:
@@ -1930,549 +730,1143 @@ class PocketMoneyPlugin(Star):
 
     @filter.command("专属格子移除")
     async def remove_from_user_slots(self, event: AstrMessageEvent, user_id: str, *, item_name: str = ""):
-        """(管理员) 从指定用户的专属格子移除物品"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能操作"))
-            return
-        
+            yield event.plain_result(self._admin_denied_msg()); return
         user_id = user_id.strip()
         if not item_name.strip():
-            yield event.plain_result("请指定要移除的物品名称")
-            return
-        
+            yield event.plain_result("请指定要移除的物品名称"); return
         if self.backpack_manager.use_user_item(user_id, item_name.strip()):
             yield event.plain_result(f"已从用户 {user_id} 的专属格子移除：{item_name}")
         else:
             yield event.plain_result(f"用户 {user_id} 的专属格子中没有找到：{item_name}")
 
-    # ------------------- 小金库笔记命令（仅管理员可用） -------------------
+    # ===============================================================
+    #  笔记命令（管理员）
+    # ===============================================================
 
     @filter.command("追加笔记")
     async def append_note(self, event: AstrMessageEvent, *, content: str = ""):
-        """(管理员) 追加内容到小金库笔记"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能操作笔记"))
-            return
-        
+            yield event.plain_result(self._admin_denied_msg()); return
         if not content.strip():
-            yield event.plain_result("请输入要追加的内容，例如：追加笔记 记得还小明5块钱")
-            return
-        
-        max_entries = self.config.get("max_note_entries", 5)
+            yield event.plain_result("请输入要追加的内容，例如：追加笔记 记得还小明5块钱"); return
+        max_entries = self._cfg("max_note_entries", 5)
         self.manager.add_note(content.strip(), max_entries)
-        current_note = self.manager.get_note()
-        yield event.plain_result(f"📝 笔记已追加，当前完整笔记：\n{current_note}")
+        yield event.plain_result(f"📝 笔记已追加，当前完整笔记：\n{self.manager.get_note()}")
 
     @filter.command("查看笔记")
     async def view_note(self, event: AstrMessageEvent):
-        """(管理员) 查看小金库笔记"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "这是AI的私密笔记，只有管理员能看"))
-            return
-        
+            yield event.plain_result(self._admin_denied_msg()); return
         note = self.manager.get_note()
-        if note:
-            yield event.plain_result(f"📝 小金库笔记：\n{note}")
-        else:
-            yield event.plain_result("📝 小金库笔记为空")
+        yield event.plain_result(f"📝 小金库笔记：\n{note}" if note else "📝 小金库笔记为空")
 
     @filter.command("删除笔记")
     async def delete_note(self, event: AstrMessageEvent, index: str = ""):
-        """(管理员) 删除指定序号的笔记"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能操作笔记"))
-            return
-        
+            yield event.plain_result(self._admin_denied_msg()); return
         if not index.strip():
-            yield event.plain_result("请指定要删除的笔记序号，例如：删除笔记 1")
-            return
-        
+            yield event.plain_result("请指定要删除的笔记序号"); return
         try:
             note_index = int(index.strip())
             if note_index <= 0:
-                yield event.plain_result("错误：序号必须是正整数")
-                return
+                yield event.plain_result("错误：序号必须是正整数"); return
         except ValueError:
-            yield event.plain_result("错误：请输入有效的序号数字")
-            return
-        
+            yield event.plain_result("错误：请输入有效的序号数字"); return
         notes = self.manager.get_notes()
         if not notes:
-            yield event.plain_result("📝 当前没有笔记可删除")
-            return
-        
+            yield event.plain_result("📝 当前没有笔记可删除"); return
         if note_index > len(notes):
-            yield event.plain_result(f"错误：序号超出范围，当前共有 {len(notes)} 条笔记")
-            return
-        
-        deleted_content = notes[note_index - 1]
+            yield event.plain_result(f"错误：序号超出范围，当前共有 {len(notes)} 条笔记"); return
+        deleted = notes[note_index - 1]
         if self.manager.delete_note(note_index):
-            current_note = self.manager.get_note()
-            if current_note:
-                yield event.plain_result(f"📝 已删除第 {note_index} 条笔记：{deleted_content}\n\n当前笔记：\n{current_note}")
-            else:
-                yield event.plain_result(f"📝 已删除第 {note_index} 条笔记：{deleted_content}\n\n笔记已清空")
-        else:
-            yield event.plain_result("删除失败，请检查序号是否正确")
+            current = self.manager.get_note()
+            yield event.plain_result(f"📝 已删除第 {note_index} 条：{deleted}\n\n{'当前笔记：' + chr(10) + current if current else '笔记已清空'}")
 
     @filter.command("清空笔记")
     async def clear_note(self, event: AstrMessageEvent):
-        """(管理员) 清空小金库笔记"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能清空笔记"))
-            return
-        
+            yield event.plain_result(self._admin_denied_msg()); return
         self.manager.clear_note()
         yield event.plain_result("📝 小金库笔记已全部清空")
 
-    # ------------------- 用户隔离池（黑名单）命令 -------------------
+    # ===============================================================
+    #  黑名单 / 隔离池
+    # ===============================================================
 
     @filter.command("零花钱拉黑")
     async def add_to_blacklist(self, event: AstrMessageEvent, user_id: str):
-        """(管理员) 将用户加入黑名单，其操作将进入隔离池"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能操作"))
-            return
-        
+            yield event.plain_result(self._admin_denied_msg()); return
         user_id = user_id.strip()
         if not user_id:
-            yield event.plain_result("请指定用户QQ号，例如：零花钱拉黑 123456789")
-            return
-        
-        # 记录迁移前的专属格子物品数量
+            yield event.plain_result("请指定用户QQ号"); return
         user_items_count = self.backpack_manager.get_user_item_count(user_id)
-        
         if self.isolation_manager.add_to_blacklist(user_id, self.manager, self.backpack_manager):
-            # 触发隔离管理器创建（仅用于背包隔离）
             self.isolation_manager.get_isolated_managers(user_id, self.manager, self.backpack_manager)
-            
-            migrate_info = ""
-            if user_items_count > 0:
-                migrate_info = f"\n已迁移 {user_items_count} 件专属格子物品到隔离池背包"
-            
-            yield event.plain_result(
-                f"🚫 用户 {user_id} 已加入隔离池\n"
-                f"金额同进同出，该用户触发的出账2h后静默退款\n"
-                f"背包独立隔离，不影响真实背包{migrate_info}"
-            )
+            migrate_info = f"\n已迁移 {user_items_count} 件专属格子物品到隔离池" if user_items_count > 0 else ""
+            yield event.plain_result(f"🚫 用户 {user_id} 已加入隔离池{migrate_info}")
         else:
             yield event.plain_result(f"用户 {user_id} 已在黑名单中")
 
     @filter.command("零花钱解除拉黑")
     async def remove_from_blacklist(self, event: AstrMessageEvent, user_id: str):
-        """(管理员) 将用户从黑名单移除"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能操作"))
-            return
-        
+            yield event.plain_result(self._admin_denied_msg()); return
         user_id = user_id.strip()
         if not user_id:
-            yield event.plain_result("请指定用户QQ号，例如：零花钱解除拉黑 123456789")
-            return
-        
-        # 记录迁移前隔离池中该用户的专属格子物品数量
+            yield event.plain_result("请指定用户QQ号"); return
         managers = self.isolation_manager.get_isolated_managers(user_id, self.manager, self.backpack_manager)
         isolated_items_count = managers["backpack"].get_user_item_count(user_id)
-        
         if self.isolation_manager.remove_from_blacklist(user_id, self.backpack_manager):
-            migrate_info = ""
-            if isolated_items_count > 0:
-                migrate_info = f"\n已迁移 {isolated_items_count} 件专属格子物品回真实背包"
+            migrate_info = f"\n已迁移 {isolated_items_count} 件专属格子物品回真实背包" if isolated_items_count > 0 else ""
             yield event.plain_result(f"✅ 用户 {user_id} 已从黑名单移除{migrate_info}")
         else:
             yield event.plain_result(f"用户 {user_id} 不在黑名单中")
 
     @filter.command("零花钱黑名单")
     async def view_blacklist(self, event: AstrMessageEvent):
-        """(管理员) 查看黑名单列表"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能查看"))
-            return
-        
+            yield event.plain_result(self._admin_denied_msg()); return
         blacklist = self.isolation_manager.get_blacklist()
-        
         if not blacklist:
-            yield event.plain_result("🚫 黑名单为空")
-            return
-        
-        # 处理到期的隔离池静默退款（操作真实金库）
+            yield event.plain_result("🚫 黑名单为空"); return
         self.isolation_manager.process_pending_refunds(self.manager)
-        
-        # 从真实金库中提取 isolation 标记的记录
-        isolation_records = [r for r in self.manager.get_all_records() if r.get("isolation")]
-        pending_refund_count = len(self.isolation_manager.pending_refunds)
-        
-        # 获取隔离池背包管理器（背包仍然独立）
-        managers = self.isolation_manager.get_isolated_managers("", self.manager, self.backpack_manager)
-        
         response = f"🚫 黑名单用户（{len(blacklist)}人）：\n"
         for uid in blacklist:
-            user_items_count = managers["backpack"].get_user_item_count(uid)
-            items_info = f"，专属物品: {user_items_count}件" if user_items_count > 0 else ""
-            response += f"- {uid}{items_info}\n"
-        
-        response += f"\n💰 真实金库余额：{self.manager.get_balance()}元（同进同出）"
-        response += f"\n📋 隔离出账记录：{len(isolation_records)}条（2h后自动退款并清除）"
-        if pending_refund_count > 0:
-            pending_total = sum(r.get("amount", 0) for r in self.isolation_manager.pending_refunds)
-            response += f"\n⏰ 待静默退款：{pending_refund_count}条 (合计 {pending_total}元)"
-        response += "\n\n金额同进同出，隔离出账2h后静默退款；背包独立隔离"
+            response += f"- {uid}\n"
         yield event.plain_result(response)
 
     @filter.command("零花钱隔离池")
     async def view_isolation_data(self, event: AstrMessageEvent, user_id: str = ""):
-        """(管理员) 查看共享隔离池数据，可选指定用户查看其专属格子"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能查看"))
-            return
-        
+            yield event.plain_result(self._admin_denied_msg()); return
         blacklist = self.isolation_manager.get_blacklist()
         if not blacklist:
-            yield event.plain_result("🚫 黑名单为空，隔离池未启用")
-            return
-        
-        # 处理到期的隔离池静默退款（操作真实金库）
+            yield event.plain_result("🚫 黑名单为空，隔离池未启用"); return
         self.isolation_manager.process_pending_refunds(self.manager)
-        
-        # 获取隔离池背包管理器（背包仍然独立）
         managers = self.isolation_manager.get_isolated_managers("", self.manager, self.backpack_manager)
-        backpack_mgr = managers["backpack"]
-        
-        # 从真实金库中提取 isolation 标记的记录
         isolation_records = [r for r in self.manager.get_all_records() if r.get("isolation")]
-        shared_items = backpack_mgr.get_shared_items()
-        
-        response = f"🔒 隔离池详情（{len(blacklist)}人，金额同进同出）：\n\n"
-        response += f"💰 真实金库余额：{self.manager.get_balance()}元\n\n"
-        
-        # 隔离出账记录（在真实金库中标记为isolation的记录）
-        response += f"📋 隔离出账记录（{len(isolation_records)}条，2h后自动退款并清除）：\n"
-        if isolation_records:
-            for r in isolation_records[-5:]:
-                type_str = "+" if r["type"] == "income" else "-"
-                operator = r.get('operator_id', '未知')
-                response += f"  {r['time']}: {type_str}{r['amount']}元 ({r['reason']}) @{operator}\n"
-        else:
-            response += "  暂无隔离出账\n"
-        
-        # 待静默退款信息
-        pending_refunds = self.isolation_manager.pending_refunds
-        if pending_refunds:
-            pending_total = sum(r.get("amount", 0) for r in pending_refunds)
-            response += f"\n⏰ 待静默退款（{len(pending_refunds)}条，合计 {pending_total}元）：\n"
-            for pr in pending_refunds[-5:]:
-                response += f"  {pr.get('time', '?')} → {pr.get('refund_at', '?')}: {pr['amount']}元 @{pr.get('operator_id', '?')}\n"
-        
-        # 共享背包物品（隔离池独立）
-        response += f"\n🎒 隔离池共享背包（{len(shared_items)}件）：\n"
-        if shared_items:
-            for item in shared_items:
-                response += f"  - {item['name']}\n"
-        else:
-            response += "  空\n"
-        
-        # 如果指定了用户，显示该用户的专属格子
-        user_id = user_id.strip()
-        if user_id:
-            if not self.isolation_manager.is_blacklisted(user_id):
-                response += f"\n⚠️ 用户 {user_id} 不在黑名单中"
-            else:
-                user_items = backpack_mgr.get_user_items(user_id)
-                response += f"\n🎁 用户 {user_id} 的专属格子（{len(user_items)}件）：\n"
-                if user_items:
-                    for item in user_items:
-                        response += f"  - {item['name']} (来自{item.get('from', '未知')})\n"
-                else:
-                    response += "  空\n"
-        else:
-            # 显示所有黑名单用户的专属格子概况
-            response += "\n🎁 各用户专属格子：\n"
-            has_items = False
-            for uid in blacklist:
-                user_items = backpack_mgr.get_user_items(uid)
-                if user_items:
-                    has_items = True
-                    response += f"  {uid}: {len(user_items)}件\n"
-            if not has_items:
-                response += "  所有用户专属格子均为空\n"
-        
+        response = f"🔒 隔离池详情（{len(blacklist)}人）\n💰 余额：{self.manager.get_balance()}元\n"
+        response += f"📋 隔离出账记录：{len(isolation_records)}条\n"
+        pending = self.isolation_manager.pending_refunds
+        if pending:
+            pt = sum(r.get("amount", 0) for r in pending)
+            response += f"⏰ 待退款：{len(pending)}条 ({pt}元)\n"
         yield event.plain_result(response)
 
-    # ------------------- 存折命令 -------------------
+    # ===============================================================
+    #  存折命令
+    # ===============================================================
 
     @filter.command("存入存折")
     async def deposit_to_savings(self, event: AstrMessageEvent, amount: str, *, reason: str = "存入存折"):
-        """(管理员) 从小金库转入存折"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能操作存折"))
-            return
-
-        try:
-            amount_value = float(amount)
-            if amount_value <= 0:
-                yield event.plain_result("错误：金额必须是正数。")
-                return
-        except ValueError:
-            yield event.plain_result("错误：金额格式不正确。")
-            return
-
-        # 检查小金库余额
-        current_balance = self.manager.get_balance()
-        if amount_value > current_balance:
-            yield event.plain_result(f"错误：小金库余额不足。当前小金库余额：{current_balance}元")
-            return
-
-        operator_id = event.get_sender_id()
-        
-        # 存入存折（deposit_to_savings 内部会从小金库扣款）
-        if not self.manager.deposit_to_savings(amount_value, reason, operator_id):
-            yield event.plain_result("存入存折失败。")
-            return
-        
-        new_pocket_balance = self.manager.get_balance()
-        new_savings_balance = self.manager.get_savings_balance()
-        
-        yield event.plain_result(
-            f"📒 存折存入成功！\n"
-            f"💰 存入金额：{amount_value}元\n"
-            f"📝 原因：{reason}\n"
-            f"💳 小金库余额：{new_pocket_balance}元\n"
-            f"📒 存折余额：{new_savings_balance}元"
-        )
+            yield event.plain_result(self._admin_denied_msg()); return
+        ok, val = self._parse_amount(amount)
+        if not ok:
+            yield event.plain_result(f"错误：{val}"); return
+        if val > self.manager.get_balance():
+            yield event.plain_result(f"错误：小金库余额不足。当前：{self.manager.get_balance()}元"); return
+        if self.manager.deposit_to_savings(val, reason, event.get_sender_id()):
+            yield event.plain_result(
+                f"📒 存折存入成功！\n💰 存入：{val}元\n"
+                f"💳 小金库余额：{self.manager.get_balance()}元\n"
+                f"📒 存折余额：{self.manager.get_savings_balance()}元"
+            )
 
     @filter.command("查看存折")
     async def view_savings(self, event: AstrMessageEvent, num: str = "5"):
-        """(管理员) 查看存折余额和最近记录"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能查看存折"))
-            return
-
-        try:
-            count = int(num)
-            if count <= 0:
-                count = 5
-        except ValueError:
-            count = 5
-
+            yield event.plain_result(self._admin_denied_msg()); return
         balance = self.manager.get_savings_balance()
         pending_count = len(self.manager.get_pending_withdrawals())
-        
         response = f"📒 存折余额：{balance}元\n"
         if pending_count > 0:
             response += f"⏳ 待审批申请：{pending_count}个\n"
-        response += "\n💡 使用「待审批列表」查看详细申请"
-        
+        response += "\n💡 使用「待审批取款」查看详细申请"
         yield event.plain_result(response)
 
     @filter.command("批准取款")
     async def approve_withdrawal(self, event: AstrMessageEvent, application_id: str, *, reason: str = ""):
-        """(管理员) 批准存折取款申请，可附加原因"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能审批取款"))
-            return
-
+            yield event.plain_result(self._admin_denied_msg()); return
         if not application_id.strip():
-            yield event.plain_result("请指定申请ID，例如：批准取款 1234 原因")
-            return
-
-        operator_id = event.get_sender_id()
+            yield event.plain_result("请指定申请ID"); return
         success, amount, apply_reason, source_info = self.manager.approve_withdrawal(
-            application_id.strip(), operator_id, reason.strip()
+            application_id.strip(), event.get_sender_id(), reason.strip()
         )
-        
         if not success:
-            yield event.plain_result(f"批准失败：{apply_reason}")
-            return
-        
+            yield event.plain_result(f"批准失败：{apply_reason}"); return
         approve_note = f"（{reason.strip()}）" if reason.strip() else ""
-        
-        # approve_withdrawal 内部已自动转入小金库
-        new_pocket_balance = self.manager.get_balance()
-        new_savings_balance = self.manager.get_savings_balance()
-        
-        # 向原窗口发送审批结果通知
         if source_info:
-            notify_msg = (
-                f"✅ 存折取款申请已批准{approve_note}！\n"
-                f"💰 取款金额：{amount}元\n"
-                f"📝 原因：{apply_reason}\n"
-                f"💳 小金库余额：{new_pocket_balance}元\n"
-                f"📒 存折余额：{new_savings_balance}元"
-            )
+            notify_msg = f"✅ 存折取款申请已批准{approve_note}！\n💰 取款：{amount}元\n💳 小金库余额：{self.manager.get_balance()}元"
             try:
                 if source_info.get("is_group") and source_info.get("group_id"):
                     await event.bot.send_group_msg(group_id=int(source_info["group_id"]), message=notify_msg)
                 elif source_info.get("user_id"):
                     await event.bot.send_private_msg(user_id=int(source_info["user_id"]), message=notify_msg)
-            except Exception as e:
-                logger.warning(f"[PocketMoney] 发送审批结果通知失败: {e}")
-        
+            except Exception:
+                pass
         yield event.plain_result(
-            f"✅ 取款申请已批准{approve_note}！\n"
-            f"📋 申请ID：{application_id}\n"
-            f"💰 取款金额：{amount}元\n"
-            f"📝 原因：{apply_reason}\n"
-            f"💳 小金库余额：{new_pocket_balance}元\n"
-            f"📒 存折余额：{new_savings_balance}元"
+            f"✅ 取款申请已批准{approve_note}！\n📋 ID：{application_id}\n"
+            f"💰 金额：{amount}元\n💳 小金库余额：{self.manager.get_balance()}元\n"
+            f"📒 存折余额：{self.manager.get_savings_balance()}元"
         )
 
     @filter.command("拒绝取款")
     async def reject_withdrawal(self, event: AstrMessageEvent, application_id: str, *, reject_reason: str = ""):
-        """(管理员) 拒绝存折取款申请"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能审批取款"))
-            return
-
+            yield event.plain_result(self._admin_denied_msg()); return
         if not application_id.strip():
-            yield event.plain_result("请指定申请ID，例如：拒绝取款 1234567890123 不批准的原因")
-            return
-
-        operator_id = event.get_sender_id()
+            yield event.plain_result("请指定申请ID"); return
         success, amount, reason, source_info = self.manager.reject_withdrawal(
-            application_id.strip(), reject_reason.strip(), operator_id
+            application_id.strip(), reject_reason.strip(), event.get_sender_id()
         )
-        
         if not success:
-            yield event.plain_result(f"拒绝失败：{reason}")
-            return
-        
-        reject_msg = f"（{reject_reason}）" if reject_reason.strip() else ""
-        savings_balance = self.manager.get_savings_balance()
-        
-        # 向原窗口发送审批结果通知
+            yield event.plain_result(f"拒绝失败：{reason}"); return
         if source_info:
-            notify_msg = (
-                f"❌ 存折取款申请被拒绝{reject_msg}\n"
-                f"💰 申请金额：{amount}元\n"
-                f"📝 申请原因：{reason}\n"
-                f"📒 存折余额：{savings_balance}元"
-            )
             try:
+                notify = f"❌ 存折取款申请被拒绝\n💰 金额：{amount}元\n📝 原因：{reason}"
                 if source_info.get("is_group") and source_info.get("group_id"):
-                    await event.bot.send_group_msg(group_id=int(source_info["group_id"]), message=notify_msg)
+                    await event.bot.send_group_msg(group_id=int(source_info["group_id"]), message=notify)
                 elif source_info.get("user_id"):
-                    await event.bot.send_private_msg(user_id=int(source_info["user_id"]), message=notify_msg)
-            except Exception as e:
-                logger.warning(f"[PocketMoney] 发送审批结果通知失败: {e}")
-        
-        yield event.plain_result(
-            f"❌ 取款申请已拒绝{reject_msg}\n"
-            f"📋 申请ID：{application_id}\n"
-            f"💰 申请金额：{amount}元\n"
-            f"📝 申请原因：{reason}\n"
-            f"📒 存折余额：{savings_balance}元"
-        )
+                    await event.bot.send_private_msg(user_id=int(source_info["user_id"]), message=notify)
+            except Exception:
+                pass
+        yield event.plain_result(f"❌ 取款申请已拒绝\n📋 ID：{application_id}\n💰 金额：{amount}元")
 
     @filter.command("忽略取款")
     async def ignore_withdrawal(self, event: AstrMessageEvent, application_id: str):
-        """(管理员) 忽略存折取款申请（静默移除，不通知申请人）"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能审批取款"))
-            return
-
+            yield event.plain_result(self._admin_denied_msg()); return
         if not application_id.strip():
-            yield event.plain_result("请指定申请ID，例如：忽略取款 1234567890123")
-            return
-
+            yield event.plain_result("请指定申请ID"); return
         success, amount, reason = self.manager.ignore_withdrawal(application_id.strip())
-        
         if not success:
-            yield event.plain_result(f"忽略失败：{reason}")
-            return
-        
-        yield event.plain_result(
-            f"🔇 取款申请已静默移除\n"
-            f"📋 申请ID：{application_id}\n"
-            f"💰 申请金额：{amount}元\n"
-            f"📝 申请原因：{reason}"
-        )
+            yield event.plain_result(f"忽略失败：{reason}"); return
+        yield event.plain_result(f"🔇 取款申请已静默移除\n📋 ID：{application_id}\n💰 金额：{amount}元")
 
     @filter.command("直接取款")
     async def direct_withdrawal(self, event: AstrMessageEvent, amount: str, *, reason: str = "管理员直接取款"):
-        """(管理员) 直接从存折取款到小金库"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能操作存折"))
-            return
-
-        try:
-            amount_value = float(amount)
-            if amount_value <= 0:
-                yield event.plain_result("错误：金额必须是正数。")
-                return
-        except ValueError:
-            yield event.plain_result("错误：金额格式不正确。")
-            return
-
-        # 检查存折余额
-        savings_balance = self.manager.get_savings_balance()
-        if amount_value > savings_balance:
-            yield event.plain_result(f"错误：存折余额不足。当前存折余额：{savings_balance}元")
-            return
-
-        operator_id = event.get_sender_id()
-        
-        # 从存折取款（withdraw_from_savings 内部已自动转入小金库）
-        if not self.manager.withdraw_from_savings(amount_value, reason, operator_id):
-            yield event.plain_result("从存折取款失败。")
-            return
-        
-        new_pocket_balance = self.manager.get_balance()
-        new_savings_balance = self.manager.get_savings_balance()
-        
-        yield event.plain_result(
-            f"📒 存折取款成功！\n"
-            f"💰 取款金额：{amount_value}元\n"
-            f"📝 原因：{reason}\n"
-            f"💳 小金库余额：{new_pocket_balance}元\n"
-            f"📒 存折余额：{new_savings_balance}元"
-        )
+            yield event.plain_result(self._admin_denied_msg()); return
+        ok, val = self._parse_amount(amount)
+        if not ok:
+            yield event.plain_result(f"错误：{val}"); return
+        if val > self.manager.get_savings_balance():
+            yield event.plain_result(f"错误：存折余额不足。当前：{self.manager.get_savings_balance()}元"); return
+        if self.manager.withdraw_from_savings(val, reason, event.get_sender_id()):
+            yield event.plain_result(
+                f"📒 存折取款成功！\n💰 取款：{val}元\n"
+                f"💳 小金库余额：{self.manager.get_balance()}元\n"
+                f"📒 存折余额：{self.manager.get_savings_balance()}元"
+            )
 
     @filter.command("待审批取款")
     async def pending_withdrawals(self, event: AstrMessageEvent):
-        """(管理员) 查看所有待审批的取款申请"""
         if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", 
-                "只有管理员能查看"))
-            return
-
+            yield event.plain_result(self._admin_denied_msg()); return
         pending = self.manager.get_pending_withdrawals()
-        
         if not pending:
-            yield event.plain_result("📋 当前没有待审批的取款申请")
-            return
-        
+            yield event.plain_result("📋 当前没有待审批的取款申请"); return
         response = f"📋 待审批取款申请（{len(pending)}个）：\n\n"
         for w in pending:
-            response += (
-                f"📌 申请ID：{w['id']}\n"
-                f"   金额：{w['amount']}元\n"
-                f"   原因：{w['reason']}\n"
-                f"   时间：{w['time']}\n\n"
-            )
-        
+            response += f"📌 ID：{w['id']}\n   金额：{w['amount']}元\n   原因：{w['reason']}\n   时间：{w['time']}\n\n"
         response += f"📒 存折余额：{self.manager.get_savings_balance()}元\n\n"
-        response += "回复「批准取款 <ID>」或「批准取款 <ID> <原因>」批准\n回复「拒绝取款 <ID> <原因>」拒绝"
-        
+        response += "回复「批准取款 <ID>」或「拒绝取款 <ID> <原因>」"
         yield event.plain_result(response)
 
+    # ===============================================================
+    #  超市系统
+    # ===============================================================
+
+    @filter.command("逛超市")
+    async def view_shop(self, event: AstrMessageEvent):
+        """查看今日超市商品"""
+        yield event.plain_result(self.shop_manager.format_shop_display())
+
+    @filter.command("购买")
+    async def buy_from_shop(self, event: AstrMessageEvent, item_input: str = ""):
+        """从超市购买商品"""
+        if not item_input.strip():
+            yield event.plain_result("请指定商品编号，例如：购买 1"); return
+
+        item_input = item_input.strip()
+        if not item_input.isdigit():
+            yield event.plain_result("请输入商品编号（数字），输入「逛超市」查看编号"); return
+
+        user_id = event.get_sender_id()
+        money_mgr, backpack_mgr, is_isolated = self._get_managers_for_user(user_id)
+
+        item_id = int(item_input)
+        shop_item = None
+        for si in self.shop_manager.get_today_items():
+            if si["id"] == item_id:
+                shop_item = si
+                break
+
+        if not shop_item:
+            yield event.plain_result(f"没有编号 {item_id} 的商品，输入「逛超市」看看今天有啥~"); return
+
+        price = shop_item["price"]
+        if price > money_mgr.get_balance():
+            yield event.plain_result(f"余额不足！{shop_item['name']} 需要 {price}元，当前余额 {money_mgr.get_balance()}元"); return
+
+        if backpack_mgr.is_shared_full():
+            yield event.plain_result("共享背包满了，先用掉一些东西吧~"); return
+
+        purchased = self.shop_manager.buy_item(shop_item["id"], user_id)
+        if not purchased:
+            yield event.plain_result("购买失败，可能已售罄"); return
+
+        money_mgr.add_expense(price, f"超市购买：{purchased['name']}", user_id, isolation=is_isolated)
+        if is_isolated:
+            self.isolation_manager.add_pending_refund(price, f"超市购买：{purchased['name']}", user_id)
+
+        backpack_mgr.add_shared_item(
+            purchased["name"], purchased["desc"],
+            expires_at=purchased.get("expires_at"),
+        )
+        self.achievement_manager.increment_counter(user_id, "purchase_count")
+
+        expiry_info = ""
+        if purchased.get("expires_at"):
+            expiry_info = f"\n⏰ 保质期至 {purchased['expires_at'][:10]}"
+
+        yield event.plain_result(
+            f"🛒 购买成功！\n"
+            f"📦 {purchased['name']} - {purchased['desc']}\n"
+            f"💰 花费 {price}元 | 余额 {money_mgr.get_balance()}元{expiry_info}"
+        )
+
+    # ===============================================================
+    #  小游戏：刮刮乐
+    # ===============================================================
+
+    @filter.command("刮刮乐")
+    async def play_scratch(self, event: AstrMessageEvent):
+        """玩刮刮乐"""
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+        ticket_price = 3
+
+        if ticket_price > money_mgr.get_balance():
+            yield event.plain_result(f"余额不足！刮刮乐一张 {ticket_price}元，当前余额 {money_mgr.get_balance()}元"); return
+
+        # 扣票价
+        money_mgr.add_expense(ticket_price, "刮刮乐", user_id, isolation=is_isolated)
+        if is_isolated:
+            self.isolation_manager.add_pending_refund(ticket_price, "刮刮乐", user_id)
+
+        # 开刮
+        prize_name, winnings, _ = self.games_manager.play_scratch_card(user_id, ticket_price)
+
+        # 发奖金
+        if winnings > 0:
+            money_mgr.data["balance"] = round(money_mgr.get_balance() + winnings, 2)
+            money_mgr._save_data()
+            net = round(winnings - ticket_price, 2)
+            net_str = f"+{net}" if net >= 0 else str(net)
+            yield event.plain_result(
+                f"🎰 刮刮乐结果：{prize_name}！\n"
+                f"💰 奖金：{winnings}元（净收益 {net_str}元）\n"
+                f"💳 当前余额：{money_mgr.get_balance()}元"
+            )
+        else:
+            yield event.plain_result(
+                f"🎰 刮刮乐结果：{prize_name}\n"
+                f"💸 花费 {ticket_price}元，下次好运~\n"
+                f"💳 当前余额：{money_mgr.get_balance()}元"
+            )
+
+    @filter.command("刮刮乐统计")
+    async def scratch_stats(self, event: AstrMessageEvent):
+        """查看个人刮刮乐统计"""
+        user_id = event.get_sender_id()
+        stats = self.games_manager.get_scratch_stats(user_id)
+        if stats["played"] == 0:
+            yield event.plain_result("你还没玩过刮刮乐呢，试试「刮刮乐」指令吧~"); return
+        net = round(stats["won"] - stats["spent"], 2)
+        net_str = f"+{net}" if net >= 0 else str(net)
+        yield event.plain_result(
+            f"🎰 你的刮刮乐统计：\n"
+            f"🎫 共玩 {stats['played']} 次\n"
+            f"💸 花费 {stats['spent']}元\n"
+            f"💰 赢得 {stats['won']}元\n"
+            f"📊 净收益：{net_str}元"
+        )
+
+    # ===============================================================
+    #  小游戏：炒股
+    # ===============================================================
+
+    @filter.command("股市")
+    async def view_stock_market(self, event: AstrMessageEvent):
+        """查看今日股市行情"""
+        user_level = self.level_manager.get_level(event.get_sender_id())
+        yield event.plain_result(self.games_manager.format_stock_market(user_level))
+
+    @filter.command("买股票")
+    async def buy_stock(self, event: AstrMessageEvent, code: str = "", shares: str = "1"):
+        """买入股票"""
+        if not code.strip():
+            yield event.plain_result("请指定股票代码和数量，例如：买股票 NEKO 5"); return
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+
+        try:
+            shares_int = int(shares)
+        except ValueError:
+            yield event.plain_result("数量必须是整数"); return
+
+        # 先检查股票和费用
+        stocks = self.games_manager.get_stock_market()
+        code_upper = code.strip().upper()
+        if code_upper not in stocks:
+            yield event.plain_result(f"没有这支股票: {code_upper}，输入「股市」看看有哪些~"); return
+
+        # 检查等级
+        user_level = self.level_manager.get_level(user_id)
+        min_level = stocks[code_upper].get("min_level", 0)
+        if user_level < min_level:
+            yield event.plain_result(f"🔒 {stocks[code_upper]['name']} 需要 Lv.{min_level} 才能交易，你当前 Lv.{user_level}"); return
+
+        total_cost = round(stocks[code_upper]["price"] * shares_int, 2)
+        if total_cost > money_mgr.get_balance():
+            yield event.plain_result(f"余额不足！需要 {total_cost}元，当前余额 {money_mgr.get_balance()}元"); return
+
+        # 扣钱
+        money_mgr.add_expense(total_cost, f"买入股票 {code_upper} x{shares_int}", user_id, isolation=is_isolated)
+        if is_isolated:
+            self.isolation_manager.add_pending_refund(total_cost, f"买入股票 {code_upper}", user_id)
+
+        # 记录持仓
+        success, msg, _ = self.games_manager.buy_stock(user_id, code_upper, shares_int)
+        yield event.plain_result(f"📈 {msg}\n💳 当前余额：{money_mgr.get_balance()}元")
+
+    @filter.command("卖股票")
+    async def sell_stock(self, event: AstrMessageEvent, code: str = "", shares: str = "1"):
+        """卖出股票"""
+        if not code.strip():
+            yield event.plain_result("请指定股票代码和数量，例如：卖股票 NEKO 5"); return
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+
+        try:
+            shares_int = int(shares)
+        except ValueError:
+            yield event.plain_result("数量必须是整数"); return
+
+        success, msg, income = self.games_manager.sell_stock(user_id, code.strip().upper(), shares_int)
+        if not success:
+            yield event.plain_result(msg); return
+
+        # 收入入账
+        if income > 0:
+            money_mgr.data["balance"] = round(money_mgr.get_balance() + income, 2)
+            money_mgr._save_data()
+
+        yield event.plain_result(f"📉 {msg}\n💳 当前余额：{money_mgr.get_balance()}元")
+
+    @filter.command("我的股票")
+    async def my_stocks(self, event: AstrMessageEvent):
+        """查看个人股票持仓"""
+        yield event.plain_result(self.games_manager.format_user_portfolio(event.get_sender_id()))
+
+    # ===============================================================
+    #  小游戏：猜大小
+    # ===============================================================
+
+    @filter.command("猜大")
+    async def guess_big(self, event: AstrMessageEvent, amount: str = ""):
+        """猜大：掷两个骰子，总和>=7为大"""
+        async for r in self._play_guess(event, "大", amount):
+            yield r
+
+    @filter.command("猜小")
+    async def guess_small(self, event: AstrMessageEvent, amount: str = ""):
+        """猜小：掷两个骰子，总和<=6为小"""
+        async for r in self._play_guess(event, "小", amount):
+            yield r
+
+    async def _play_guess(self, event: AstrMessageEvent, guess: str, amount_str: str):
+        if not amount_str.strip():
+            yield event.plain_result("请下注金额，例如：猜大 10"); return
+        ok, bet = self._parse_amount(amount_str)
+        if not ok:
+            yield event.plain_result(f"错误：{bet}"); return
+
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+
+        if bet > money_mgr.get_balance():
+            yield event.plain_result(f"余额不足！当前 {money_mgr.get_balance()}元"); return
+
+        # 掷骰子
+        d1 = random.randint(1, 6)
+        d2 = random.randint(1, 6)
+        total = d1 + d2
+        result = "大" if total >= 7 else "小"
+        win = (guess == result)
+
+        if win:
+            winnings = round(bet, 2)
+            money_mgr.data["balance"] = round(money_mgr.get_balance() + winnings, 2)
+            money_mgr._save_data()
+            self.level_manager.add_xp(user_id, 5, "猜大小赢了")
+            yield event.plain_result(
+                f"🎲 {d1} + {d2} = {total}（{result}）\n"
+                f"✅ 你猜{guess}，猜对了！+{winnings}元\n"
+                f"💳 余额：{money_mgr.get_balance()}元"
+            )
+        else:
+            money_mgr.add_expense(bet, f"猜大小：猜{guess}输了", user_id, isolation=is_isolated)
+            if is_isolated:
+                self.isolation_manager.add_pending_refund(bet, "猜大小", user_id)
+            yield event.plain_result(
+                f"🎲 {d1} + {d2} = {total}（{result}）\n"
+                f"❌ 你猜{guess}，没猜对！-{bet}元\n"
+                f"💳 余额：{money_mgr.get_balance()}元"
+            )
+
+        self._check_achievements(user_id)
+
+    # ===============================================================
+    #  帮助菜单
+    # ===============================================================
+
+    @filter.command("零花钱帮助")
+    async def show_help(self, event: AstrMessageEvent):
+        """显示全部可用指令"""
+        help_text = (
+            "📖 零花钱系统 - 指令大全\n\n"
+            "💰 经济\n"
+            "  签到 | 等级 | 成就 | 银行 | 存银行 <金额> | 取银行 <编号>\n\n"
+            "🏪 超市\n"
+            "  逛超市 | 购买 <编号>\n\n"
+            "🎮 小游戏\n"
+            "  刮刮乐 | 刮刮乐统计\n"
+            "  猜大 <金额> | 猜小 <金额>\n"
+            "  股市 | 买股票 <代码> <数量> | 卖股票 <代码> <数量> | 我的股票\n\n"
+            "🎒 背包\n"
+            "  我的格子\n\n"
+            "💌 社交\n"
+            "  发表扬信 | 发投诉信 <理由> | 表扬信排行\n\n"
+            "📅 其他\n"
+            "  零花钱日期 | 今日表扬\n\n"
+            "🔧 管理员\n"
+            "  发零花钱 | 扣零花钱 | 设置余额 | 查账 | 查流水 | 清空流水\n"
+            "  存入存折 | 查看存折 | 批准取款 | 拒绝取款 | 直接取款 | 待审批取款\n"
+            "  查看背包 | 清空背包 | 背包移除 | 查看专属格子 | 清空专属格子\n"
+            "  追加笔记 | 查看笔记 | 删除笔记 | 清空笔记\n"
+            "  零花钱拉黑 | 零花钱解除拉黑 | 零花钱黑名单 | 零花钱隔离池\n"
+            "  刷新超市\n\n"
+            "💡 大部分功能也可以直接和bot说话触发~"
+        )
+        yield event.plain_result(help_text)
+
+    # ===============================================================
+    #  签到 / 等级 / 成就
+    # ===============================================================
+
+    def _check_achievements(self, user_id: str, extra_stats: Dict = None) -> List[str]:
+        """检查并解锁成就，返回新解锁的提示消息列表"""
+        stats = {
+            "balance": self.manager.get_balance(),
+            "level": self.level_manager.get_level(user_id),
+            "sign_streak": self.level_manager.get_sign_in_info(user_id).get("streak", 0),
+            "sign_total": self.level_manager.get_sign_in_info(user_id).get("total", 0),
+            "bank_interest": self.bank_manager._get_account(user_id).get("total_interest", 0),
+            "bank_deposit_count": len(self.bank_manager._get_account(user_id).get("deposits", [])),
+        }
+        if extra_stats:
+            stats.update(extra_stats)
+
+        newly = self.achievement_manager.check_and_unlock(user_id, **stats)
+        msgs = []
+        for name, desc in newly:
+            self.level_manager.add_xp(user_id, self.achievement_manager.UNLOCK_XP_REWARD, f"成就: {name}")
+            msgs.append(f"🏆 成就解锁：{name} - {desc}（+{self.achievement_manager.UNLOCK_XP_REWARD}XP）")
+        return msgs
+
+    @filter.command("签到")
+    async def sign_in(self, event: AstrMessageEvent):
+        """每日签到"""
+        user_id = event.get_sender_id()
+        user_name = event.get_sender_name() or user_id
+        success, xp, streak, new_level = self.level_manager.sign_in(user_id)
+        if not success:
+            yield event.plain_result("你今天已经签到过啦，明天再来~"); return
+
+        # 签到奖励零花钱
+        sign_bonus = self._cfg("sign_in_bonus", 2)
+        self.manager.data["balance"] = round(self.manager.get_balance() + sign_bonus, 2)
+        self.manager._save_data()
+
+        response = (
+            f"✅ {user_name} 签到成功！\n"
+            f"✨ 经验 +{xp} | 零花钱 +{sign_bonus}元\n"
+            f"📅 连续签到：{streak}天\n"
+            f"⭐ Lv.{new_level} | 余额：{self.manager.get_balance()}元"
+        )
+
+        # 检查成就
+        ach_msgs = self._check_achievements(user_id)
+        if ach_msgs:
+            response += "\n\n" + "\n".join(ach_msgs)
+
+        yield event.plain_result(response)
+
+    @filter.command("等级")
+    async def view_level(self, event: AstrMessageEvent):
+        """查看等级信息"""
+        user_id = event.get_sender_id()
+        user_name = event.get_sender_name() or user_id
+        yield event.plain_result(self.level_manager.format_level_card(user_id, user_name))
+
+    @filter.command("成就")
+    async def view_achievements(self, event: AstrMessageEvent):
+        """查看成就"""
+        # 先触发一次检查
+        user_id = event.get_sender_id()
+        self._check_achievements(user_id)
+        yield event.plain_result(self.achievement_manager.format_achievements(user_id))
+
+    # ===============================================================
+    #  银行系统
+    # ===============================================================
+
+    @filter.command("银行")
+    async def view_bank(self, event: AstrMessageEvent):
+        """查看银行账户"""
+        user_id = event.get_sender_id()
+        user_level = self.level_manager.get_level(user_id)
+        # 结算利息
+        interest = self.bank_manager.settle_interest(user_id, user_level)
+        response = self.bank_manager.format_bank_info(user_id, user_level)
+        if interest > 0:
+            response = f"💹 今日利息已到账：+{interest}元\n\n" + response
+        yield event.plain_result(response)
+
+    @filter.command("存银行")
+    async def bank_deposit(self, event: AstrMessageEvent, amount: str = ""):
+        """存钱到银行"""
+        if not amount.strip():
+            yield event.plain_result(f"请指定金额，例如：存银行 10000（最低{self.bank_manager.MIN_DEPOSIT}元）"); return
+        user_id = event.get_sender_id()
+        ok, val = self._parse_amount(amount)
+        if not ok:
+            yield event.plain_result(f"错误：{val}"); return
+        if val > self.manager.get_balance():
+            yield event.plain_result(f"余额不足！当前余额 {self.manager.get_balance()}元"); return
+        success, msg = self.bank_manager.deposit(user_id, val)
+        if not success:
+            yield event.plain_result(msg); return
+        self.manager.add_expense(val, f"银行存款", user_id)
+        self.achievement_manager.increment_counter(user_id, "bank_deposit_count")
+        ach_msgs = self._check_achievements(user_id)
+        response = f"🏦 {msg}\n💳 小金库余额：{self.manager.get_balance()}元"
+        if ach_msgs:
+            response += "\n\n" + "\n".join(ach_msgs)
+        yield event.plain_result(response)
+
+    @filter.command("取银行")
+    async def bank_withdraw(self, event: AstrMessageEvent, index: str = "1"):
+        """从银行取款"""
+        user_id = event.get_sender_id()
+        try:
+            idx = int(index) - 1
+        except ValueError:
+            yield event.plain_result("请输入存款编号"); return
+        # 先结算利息
+        user_level = self.level_manager.get_level(user_id)
+        self.bank_manager.settle_interest(user_id, user_level)
+        success, msg, amount = self.bank_manager.withdraw(user_id, idx)
+        if not success:
+            yield event.plain_result(msg); return
+        self.manager.data["balance"] = round(self.manager.get_balance() + amount, 2)
+        self.manager._save_data()
+        yield event.plain_result(f"🏦 {msg}\n💳 小金库余额：{self.manager.get_balance()}元")
+
+    # ===============================================================
+    #  AI 商品生成
+    # ===============================================================
+
+    async def _generate_ai_shop(self):
+        """调用AI生成今日商品"""
+        if not self._shop_provider_name:
+            self.shop_manager.refresh_with_defaults()
+            return
+
+        try:
+            prompt = ShopManager.build_ai_prompt()
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=self._shop_provider_name,
+                prompt=prompt,
+            )
+            text = llm_resp.completion_text.strip()
+            # 提取JSON
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            items = json.loads(text)
+            if isinstance(items, list) and len(items) > 0:
+                self.shop_manager.refresh_with_ai_items(items)
+                logger.info(f"[Shop] AI生成了 {len(items)} 个商品")
+                return
+        except Exception as e:
+            logger.warning(f"[Shop] AI生成商品失败，使用默认: {e}")
+
+        self.shop_manager.refresh_with_defaults()
+
+    @filter.command("刷新超市")
+    async def refresh_shop(self, event: AstrMessageEvent):
+        """(管理员) 手动刷新超市"""
+        if not self._is_admin(event):
+            yield event.plain_result(self._admin_denied_msg()); return
+        await self._generate_ai_shop()
+        yield event.plain_result("🏪 超市已刷新！\n" + self.shop_manager.format_shop_display())
+
+    # ===============================================================
+    #  LLM 工具（bot自己能用的）
+    # ===============================================================
+
+    @llm_tool(name="pm_sign_in")
+    async def tool_sign_in(self, event: AstrMessageEvent):
+        '''签到。当用户说想签到、打卡、签个到之类的话时使用。每天只能签一次。
+
+        Args:
+        '''
+        user_id = event.get_sender_id()
+        user_name = event.get_sender_name() or user_id
+        success, xp, streak, new_level = self.level_manager.sign_in(user_id)
+        if not success:
+            return "今天已经签到过啦，明天再来~"
+        sign_bonus = self._cfg("sign_in_bonus", 2)
+        self.manager.data["balance"] = round(self.manager.get_balance() + sign_bonus, 2)
+        self.manager._save_data()
+        ach_msgs = self._check_achievements(user_id)
+        result = f"签到成功！经验+{xp}，零花钱+{sign_bonus}元，连续{streak}天，Lv.{new_level}，余额{self.manager.get_balance()}元"
+        if ach_msgs:
+            result += "。" + "；".join(ach_msgs)
+        return result
+
+    @llm_tool(name="pm_view_shop")
+    async def tool_view_shop(self, event: AstrMessageEvent):
+        '''查看今日超市有哪些商品在售。在想买东西或用户提到超市时使用。
+
+        Args:
+        '''
+        return self.shop_manager.format_shop_display()
+
+    @llm_tool(name="pm_buy_item")
+    async def tool_buy_item(self, event: AstrMessageEvent, item_name: str):
+        '''从超市购买指定商品。购买前请先用pm_view_shop查看有什么。
+
+        Args:
+            item_name(string): 商品名称
+        '''
+        user_id = event.get_sender_id()
+        money_mgr, backpack_mgr, is_isolated = self._get_managers_for_user(user_id)
+
+        shop_item = self.shop_manager.find_item_by_name(item_name)
+        if not shop_item:
+            return f"超市里没有「{item_name}」"
+
+        price = shop_item["price"]
+        if price > money_mgr.get_balance():
+            return f"余额不足！{shop_item['name']}需要{price}元，余额{money_mgr.get_balance()}元"
+
+        if backpack_mgr.is_shared_full():
+            return "共享背包满了，需要先用掉或送出一些东西腾出空位"
+
+        purchased = self.shop_manager.buy_item(shop_item["id"], user_id)
+        if not purchased:
+            return "已售罄"
+
+        money_mgr.add_expense(price, f"超市购买：{purchased['name']}", user_id, isolation=is_isolated)
+        backpack_mgr.add_shared_item(purchased["name"], purchased["desc"], expires_at=purchased.get("expires_at"))
+        self.achievement_manager.increment_counter(user_id, "purchase_count")
+
+        return f"购买成功：{purchased['name']}，花费{price}元，余额{money_mgr.get_balance()}元"
+
+    @llm_tool(name="pm_view_stocks")
+    async def tool_view_stocks(self, event: AstrMessageEvent):
+        '''查看今日股市行情。在想炒股或用户提到股票时使用。
+
+        Args:
+        '''
+        user_level = self.level_manager.get_level(event.get_sender_id())
+        return self.games_manager.format_stock_market(user_level)
+
+    @llm_tool(name="pm_buy_stock")
+    async def tool_buy_stock(self, event: AstrMessageEvent, code: str, shares: str):
+        '''买入股票。
+
+        Args:
+            code(string): 股票代码，如 NEKO
+            shares(string): 买入数量
+        '''
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+        try:
+            shares_int = int(shares)
+        except ValueError:
+            return "数量必须是整数"
+
+        stocks = self.games_manager.get_stock_market()
+        code_upper = code.upper()
+        if code_upper not in stocks:
+            return f"没有这支股票: {code_upper}"
+
+        user_level = self.level_manager.get_level(user_id)
+        if stocks[code_upper].get("min_level", 0) > user_level:
+            return f"等级不够，需要Lv.{stocks[code_upper]['min_level']}"
+
+        total_cost = round(stocks[code_upper]["price"] * shares_int, 2)
+        if total_cost > money_mgr.get_balance():
+            return f"余额不足，需要{total_cost}元"
+
+        money_mgr.add_expense(total_cost, f"买入 {code_upper} x{shares_int}", user_id, isolation=is_isolated)
+        success, msg, _ = self.games_manager.buy_stock(user_id, code_upper, shares_int)
+        return f"{msg}，余额{money_mgr.get_balance()}元"
+
+    @llm_tool(name="pm_sell_stock")
+    async def tool_sell_stock(self, event: AstrMessageEvent, code: str, shares: str):
+        '''卖出股票。
+
+        Args:
+            code(string): 股票代码
+            shares(string): 卖出数量
+        '''
+        user_id = event.get_sender_id()
+        money_mgr, _, _ = self._get_managers_for_user(user_id)
+        try:
+            shares_int = int(shares)
+        except ValueError:
+            return "数量必须是整数"
+
+        success, msg, income = self.games_manager.sell_stock(user_id, code.upper(), shares_int)
+        if not success:
+            return msg
+        if income > 0:
+            money_mgr.data["balance"] = round(money_mgr.get_balance() + income, 2)
+            money_mgr._save_data()
+        return f"{msg}，余额{money_mgr.get_balance()}元"
+
+    @llm_tool(name="pm_check_balance")
+    async def tool_check_balance(self, event: AstrMessageEvent):
+        '''查看当前零花钱余额和背包状态。
+
+        Args:
+        '''
+        user_id = event.get_sender_id()
+        money_mgr, backpack_mgr, _ = self._get_managers_for_user(user_id)
+        items = backpack_mgr.get_user_items(user_id)
+        items_str = "、".join(i["name"] for i in items) if items else "空"
+        return f"余额{money_mgr.get_balance()}元，背包({len(items)}/{backpack_mgr.max_user_slots})：{items_str}"
+
+    @llm_tool(name="pm_play_scratch")
+    async def tool_play_scratch(self, event: AstrMessageEvent):
+        '''玩刮刮乐。
+
+        Args:
+        '''
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+        ticket_price = 3
+        if ticket_price > money_mgr.get_balance():
+            return f"余额不足，需要{ticket_price}元"
+
+        money_mgr.add_expense(ticket_price, "刮刮乐", user_id, isolation=is_isolated)
+        prize_name, winnings, _ = self.games_manager.play_scratch_card(user_id, ticket_price)
+        if winnings > 0:
+            money_mgr.data["balance"] = round(money_mgr.get_balance() + winnings, 2)
+            money_mgr._save_data()
+        net = round(winnings - ticket_price, 2)
+        return f"刮刮乐结果：{prize_name}！奖金{winnings}元（净{'+' if net>=0 else ''}{net}元），余额{money_mgr.get_balance()}元"
+
+    # ===============================================================
+    #  跨bot赠送系统
+    # ===============================================================
+
+    @llm_tool(name="pm_give_to_user")
+    async def tool_give_to_user(self, event: AstrMessageEvent, item_name: str):
+        '''把自己背包里的东西送给当前正在说话的用户。用户说"我想要你的XX"之类的时候使用。
+
+        Args:
+            item_name(string): 物品名称
+        '''
+        user_id = event.get_sender_id()
+        user_name = event.get_sender_name() or user_id
+
+        # 从共享背包查找
+        shared = self.backpack_manager.get_shared_items()
+        found = None
+        for item in shared:
+            if _name_match(item["name"], item_name):
+                found = item
+                break
+        if not found:
+            return f"背包里没有「{item_name}」"
+
+        # 检查用户格子空间
+        if self.backpack_manager.is_user_slots_full(user_id):
+            return f"{user_name}的格子满了，放不下"
+
+        # 从共享背包取出 → 放入用户格子
+        desc = found.get("description", "")
+        expires = found.get("expires_at")
+        self.backpack_manager.use_shared_item(found["name"])
+        self.backpack_manager.add_user_gift(
+            user_id, found["name"], desc,
+            "背包赠送", expires_at=expires,
+        )
+        return f"已把「{found['name']}」送给{user_name}，放进了ta的专属格子"
+
+    @llm_tool(name="pm_use_user_item")
+    async def tool_use_user_item(self, event: AstrMessageEvent, item_name: str):
+        '''使用/消耗用户专属格子里的物品。用户说"吃掉XX""用掉XX""丢掉XX"之类的时候使用。
+
+        Args:
+            item_name(string): 要使用的物品名称
+        '''
+        user_id = event.get_sender_id()
+        _, backpack_mgr, _ = self._get_managers_for_user(user_id)
+        if backpack_mgr.use_user_item(user_id, item_name):
+            return f"已使用「{item_name}」，从专属格子中移除了"
+        # 也试试共享背包
+        if backpack_mgr.use_shared_item(item_name):
+            return f"已使用「{item_name}」，从共享背包中移除了"
+        return f"没有找到「{item_name}」"
+
+    @llm_tool(name="pm_gift_item")
+    async def tool_gift_item(self, event: AstrMessageEvent, item_name: str, to_user: str):
+        '''跨bot赠送：把物品送给另一个bot管理的用户。会发出固定格式赠送消息等待对方bot接收。
+
+        Args:
+            item_name(string): 要赠送的物品名称
+            to_user(string): 赠送对象的名字
+        '''
+        if not self._gift_bot_name:
+            return "赠送功能未配置bot名称（gift_bot_name）"
+
+        user_id = event.get_sender_id()
+        _, backpack_mgr, _ = self._get_managers_for_user(user_id)
+
+        # 查找物品
+        items = backpack_mgr.get_user_items(user_id)
+        found = None
+        for item in items:
+            if _name_match(item["name"], item_name):
+                found = item
+                break
+        if not found:
+            shared = backpack_mgr.get_shared_items()
+            for item in shared:
+                if _name_match(item["name"], item_name):
+                    found = item
+                    found["_from_shared"] = True
+                    break
+        if not found:
+            return f"背包里没有「{item_name}」"
+
+        # 从背包取出
+        if found.get("_from_shared"):
+            backpack_mgr.use_shared_item(found["name"])
+        else:
+            backpack_mgr.use_user_item(user_id, found["name"])
+
+        # 创建赠送记录
+        record = self.gift_manager.create_outgoing(
+            item_name=found["name"],
+            item_desc=found.get("description", found.get("desc", "")),
+            from_bot=self._gift_bot_name,
+            to_user=to_user,
+            sender_user_id=user_id,
+            expires_at=found.get("expires_at"),
+        )
+
+        # 直接发送赠送消息到群里（不能让LLM改写）
+        gift_msg = GiftManager.format_gift_offer(
+            self._gift_bot_name, found["name"], to_user,
+            record["timestamp"], record["signature"],
+        )
+        await event.send(event.plain_result(gift_msg))
+        return f"已发出赠送「{found['name']}」给{to_user}的请求，等待对方bot接收（5分钟超时自动退回）"
+
+    @filter.regex(r"「.+?」发起赠送「.+?」给 @.+?，是否接收？\[GK:[a-f0-9]{6}:\d+\]")
+    async def on_gift_offer(self, event: AstrMessageEvent):
+        """收到赠送消息时：验签 → 调API决定接不接 → 回复"""
+        if not self._gift_bot_name:
+            return
+
+        text = event.message_str
+        parsed = GiftManager.parse_gift_offer(text)
+        if not parsed:
+            return
+
+        # 不接收自己发的
+        if parsed["bot_name"] == self._gift_bot_name:
+            return
+
+        # 验签
+        if not verify_gift(parsed["item_name"], parsed["bot_name"], parsed["timestamp"], parsed["signature"]):
+            logger.debug(f"[Gift] 签名验证失败，忽略")
+            return
+
+        # 检查背包空间
+        # 赠送是给bot的，所以用共享背包
+        if self.backpack_manager.is_shared_full():
+            ts = parsed["timestamp"]
+            sig = parsed["signature"]
+            msg = GiftManager.format_reject(
+                self._gift_bot_name, parsed["item_name"],
+                "专属格子满了放不下啦...", ts, sig,
+            )
+            yield event.plain_result(msg)
+            return
+
+        # 调用LLM决定是否接收（走人设）
+        flavor = "那我就不客气啦~"
+        accept = True
+        try:
+            umo = event.unified_msg_origin
+            prov_id = await self.context.get_current_chat_provider_id(umo=umo)
+            if prov_id:
+                prompt = (
+                    f"有人（{parsed['bot_name']}）要送你一个「{parsed['item_name']}」。"
+                    f"你要接受吗？请只回复一个JSON："
+                    f'{{"accept": true/false, "reply": "你的一句话回复"}}'
+                )
+                llm_resp = await self.context.llm_generate(
+                    chat_provider_id=prov_id, prompt=prompt,
+                )
+                resp_text = llm_resp.completion_text.strip()
+                if "```" in resp_text:
+                    resp_text = resp_text.split("```")[1]
+                    if resp_text.startswith("json"):
+                        resp_text = resp_text[4:]
+                result = json.loads(resp_text)
+                accept = result.get("accept", True)
+                flavor = result.get("reply", flavor)
+        except Exception as e:
+            logger.debug(f"[Gift] LLM决策失败，默认接收: {e}")
+
+        ts = parsed["timestamp"]
+        sig = parsed["signature"]
+
+        if accept:
+            # 入库
+            self.backpack_manager.add_shared_item(parsed["item_name"], f"来自{parsed['bot_name']}的赠送")
+            self.gift_manager.log_received(
+                parsed["item_name"], "", parsed["bot_name"],
+                self._gift_bot_name, "",
+            )
+            msg = GiftManager.format_accept(
+                self._gift_bot_name, parsed["item_name"], flavor, ts, sig,
+            )
+        else:
+            msg = GiftManager.format_reject(
+                self._gift_bot_name, parsed["item_name"], flavor, ts, sig,
+            )
+
+        yield event.plain_result(msg)
+
+    @filter.regex(r"「.+?」(?:接收了|拒绝了)「.+?」[！。].*?\[G[AR]:[a-f0-9]{6}:\d+\]")
+    async def on_gift_response(self, event: AstrMessageEvent):
+        """收到接收/拒绝回复时：验签 → 结算 → 调API说一句话"""
+        if not self._gift_bot_name:
+            return
+
+        text = event.message_str
+        parsed = GiftManager.parse_gift_response(text)
+        if not parsed:
+            return
+
+        # 不处理自己发的回复
+        if parsed["bot_name"] == self._gift_bot_name:
+            return
+
+        # 验签
+        if not verify_gift(parsed["item_name"], self._gift_bot_name, parsed["timestamp"], parsed["signature"]):
+            return
+
+        # 查找对应的待处理赠送
+        record = self.gift_manager.find_pending(parsed["item_name"], self._gift_bot_name)
+        if not record:
+            return
+
+        if parsed["accepted"]:
+            self.gift_manager.mark_accepted(parsed["item_name"], self._gift_bot_name)
+            # 调API说一句话
+            flavor = "送出去啦~"
+            try:
+                umo = event.unified_msg_origin
+                prov_id = await self.context.get_current_chat_provider_id(umo=umo)
+                if prov_id:
+                    prompt = (
+                        f"{parsed['bot_name']}接收了你送出的「{parsed['item_name']}」。"
+                        f"请用一句话表达你的心情，直接回复这句话即可。"
+                    )
+                    llm_resp = await self.context.llm_generate(
+                        chat_provider_id=prov_id, prompt=prompt,
+                    )
+                    flavor = llm_resp.completion_text.strip()
+            except Exception:
+                pass
+            yield event.plain_result(flavor)
+        else:
+            # 拒绝 → 物品退回
+            self.gift_manager.mark_rejected(parsed["item_name"], self._gift_bot_name)
+            sender_id = record.get("sender_user_id", "")
+            _, backpack_mgr, _ = self._get_managers_for_user(sender_id)
+            backpack_mgr.add_shared_item(
+                record["item_name"], record.get("item_desc", ""),
+                expires_at=record.get("item_expires_at"),
+            )
+            # 调API说一句话
+            flavor = "被退回来了..."
+            try:
+                umo = event.unified_msg_origin
+                prov_id = await self.context.get_current_chat_provider_id(umo=umo)
+                if prov_id:
+                    prompt = (
+                        f"{parsed['bot_name']}拒绝了你送出的「{parsed['item_name']}」。"
+                        f"请用一句话表达你的心情，直接回复这句话即可。"
+                    )
+                    llm_resp = await self.context.llm_generate(
+                        chat_provider_id=prov_id, prompt=prompt,
+                    )
+                    flavor = llm_resp.completion_text.strip()
+            except Exception:
+                pass
+            yield event.plain_result(flavor)
+
+    # ===============================================================
+    #  终止
+    # ===============================================================
+
     async def terminate(self):
-        """插件终止时保存数据"""
+        # 清理超时赠送，退回物品
+        expired = self.gift_manager.cleanup_expired()
+        for record in expired:
+            sender_id = record.get("sender_user_id", "")
+            if sender_id:
+                _, backpack_mgr, _ = self._get_managers_for_user(sender_id)
+                backpack_mgr.add_shared_item(
+                    record["item_name"], record.get("item_desc", ""),
+                    expires_at=record.get("item_expires_at"),
+                )
+            logger.info(f"[Gift] 赠送超时退回: {record['item_name']}")
+
         self.manager._save_data()
         self.thank_manager._save_data()
         self.backpack_manager._save_data()
         self.isolation_manager._save_data()
+        self.level_manager._save_data()
+        self.bank_manager._save_data()
+        self.achievement_manager._save_data()
+        self.gift_manager._save_data()
