@@ -129,6 +129,7 @@ class PocketMoneyPlugin(Star):
         self._shop_provider_name = cfg("shop_provider_name", "")
         self._shop_generate_hour = cfg("shop_generate_hour", 6)
         self._shop_gen_task = None
+        self._soup_judge_provider = cfg("soup_judge_provider", "")
 
         # ---------- 正则表达式 ----------
         self._compile_patterns()
@@ -328,15 +329,29 @@ class PocketMoneyPlugin(Star):
         req.system_prompt += f"\n{pocketmoney_prompt}"
         req.system_prompt += f"\n{backpack_prompt}"
 
-        # 海龟汤裁判上下文注入
+        # 海龟汤裁判上下文注入（仅在没有单独裁判 API 时注入主 LLM）
         soup_session_key = TurtleSoupManager.get_session_key(event)
         active_soup = self.turtle_soup_manager.get_active_soup(soup_session_key)
-        if active_soup:
-            req.system_prompt += TurtleSoupManager.build_judge_system_prompt(active_soup)
+        if active_soup and not self._soup_judge_configured():
+            req.system_prompt = TurtleSoupManager.build_judge_system_prompt(active_soup)
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
         """处理LLM响应中的标记"""
+
+        # ====== 海龟汤裁判 API 拦截 ======
+        # 如果配了单独裁判 API + 当前有活跃汤 → 丢弃主 LLM 回复，用裁判 API 的回复替换
+        if self._soup_judge_configured():
+            soup_session_key = TurtleSoupManager.get_session_key(event)
+            active_soup = self.turtle_soup_manager.get_active_soup(soup_session_key)
+            if active_soup:
+                user_msg = getattr(event, "message_str", "") or ""
+                if user_msg.strip():
+                    judge_reply = await self._call_soup_judge(active_soup, user_msg)
+                    if judge_reply:
+                        resp.completion_text = judge_reply
+                        return  # 跳过后续标记处理（裁判回复不含花钱/入库标记）
+
         original_text = resp.completion_text
         cleaned_text = original_text
 
@@ -1410,26 +1425,29 @@ class PocketMoneyPlugin(Star):
 
         # 调用 LLM 判断猜测与汤底的相似度
         answer = puzzle.get("answer", "")
-        try:
-            umo = event.unified_msg_origin
-            prov_id = await self.context.get_current_chat_provider_id(umo=umo)
-            if not prov_id:
-                yield event.plain_result("🐢 无法调用判定，请直接「揭晓汤底」查看答案"); return
+        judge_prompt = (
+            "你是海龟汤游戏裁判。请判断玩家的猜测是否与汤底的核心真相大体一致。\n\n"
+            f"【汤底（标准答案）】：{answer}\n"
+            f"【玩家猜测】：{guess}\n\n"
+            "判断标准：玩家不需要说出每个细节，只要抓住了核心反转/关键真相即算正确。\n"
+            "请严格按以下 JSON 格式返回，不要有任何其他内容：\n"
+            '{"correct": true或false, "comment": "一句话点评"}'
+        )
 
-            judge_prompt = (
-                "你是海龟汤游戏裁判。请判断玩家的猜测是否与汤底的核心真相大体一致。\n\n"
-                f"【汤底（标准答案）】：{answer}\n"
-                f"【玩家猜测】：{guess}\n\n"
-                "判断标准：玩家不需要说出每个细节，只要抓住了核心反转/关键真相即算正确。\n"
-                "请严格按以下 JSON 格式返回，不要有任何其他内容：\n"
-                '{"correct": true或false, "comment": "一句话点评"}'
-            )
+        resp_text = ""
+        try:
+            # 确定 provider：优先裁判 Provider，否则走主 LLM
+            if self._soup_judge_configured():
+                prov_id = self._soup_judge_provider
+            else:
+                umo = event.unified_msg_origin
+                prov_id = await self.context.get_current_chat_provider_id(umo=umo)
+                if not prov_id:
+                    yield event.plain_result("🐢 无法调用判定，请直接「揭晓汤底」查看答案"); return
+
             llm_resp = await self.context.llm_generate(
                 chat_provider_id=prov_id, prompt=judge_prompt,
             )
-
-            # 提取判定结果
-            resp_text = ""
             try:
                 resp_text = llm_resp.completion_text or ""
             except Exception:
@@ -1691,6 +1709,31 @@ class PocketMoneyPlugin(Star):
             f"标题: {p.get('name', '')}\n内容: {p.get('snippet', '')}"
             for p in pages[:5]
         )
+
+    def _soup_judge_configured(self) -> bool:
+        """检查是否配置了单独的裁判 Provider"""
+        return bool(self._soup_judge_provider)
+
+    async def _call_soup_judge(self, puzzle: Dict, user_message: str) -> Optional[str]:
+        """调用单独的裁判 Provider"""
+        if not self._soup_judge_provider:
+            return None
+
+        answer = puzzle.get("answer", "")
+        prompt = TurtleSoupManager.build_judge_direct_prompt(answer, user_message)
+
+        try:
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=self._soup_judge_provider,
+                prompt=prompt,
+            )
+            text = (llm_resp.completion_text or "").strip()
+            if text:
+                logger.info(f"[TurtleSoup] 裁判 Provider 返回: {text[:100]}")
+                return text
+        except Exception as e:
+            logger.warning(f"[TurtleSoup] 裁判 Provider 调用失败: {e}")
+        return None
 
     async def _search_chat_api(self, url: str, key: str, search_type: str, exclude_titles: list = None) -> Optional[dict]:
         """OpenAI / Grok(xAI) 兼容的 Chat API（自带联网）"""

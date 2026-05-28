@@ -71,10 +71,17 @@
                 "hint": "对应搜索服务的 API Key"
             },
             "soup_search_url": {
-                "description": "自定义 API 地址（可选）",
+                "description": "自定义搜索 API 地址（可选）",
                 "type": "string",
                 "default": "",
                 "hint": "仅在使用中转/自建服务时需要填写，留空则自动使用官方地址"
+            },
+            "soup_judge_provider": {
+                "description": "海龟汤裁判 Provider（可选）",
+                "type": "string",
+                "default": "",
+                "hint": "单独给海龟汤裁判用的模型，留空则走主 LLM",
+                "_special": "select_provider"
             }
         }
     },
