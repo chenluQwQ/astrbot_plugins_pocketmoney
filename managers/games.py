@@ -451,3 +451,279 @@ class GamesManager:
         return self.data.get("slots_stats", {}).get(
             user_id, {"played": 0, "spent": 0, "won": 0, "jackpots": 0, "best_multi": 0}
         )
+
+    # ============================================================
+    #  LLM 工具专用：沉浸式格式化输出
+    # ============================================================
+
+    @staticmethod
+    def format_scratch_immersive(prize_name: str, winnings: float, ticket_price: float, balance: float) -> str:
+        """刮刮乐 LLM 工具沉浸式输出（类似指令格式）"""
+        net = round(winnings - ticket_price, 2)
+        # 生成3个刮开区域
+        symbols = ["💰", "🎁", "⭐", "🍀", "💎", "🎊", "❌", "🔔"]
+        if winnings > 0:
+            # 赢了：根据奖项给不同的展示
+            if "头奖" in prize_name:
+                slots = ["💎", "💎", "💎"]
+            elif "大奖" in prize_name:
+                slots = ["⭐", "⭐", "⭐"]
+            elif "中奖" in prize_name:
+                slots = ["🎁", "🎁", random.choice(["🎁", "⭐"])]
+            elif "小奖" in prize_name:
+                slots = ["💰", "💰", random.choice(symbols)]
+            elif "回本" in prize_name:
+                slots = ["🍀", "🍀", random.choice(symbols)]
+            else:
+                slots = [random.choice(["🍀", "💰"]), random.choice(symbols), random.choice(symbols)]
+            net_str = f"+{net}" if net >= 0 else str(net)
+            result = (
+                f"┌─────────────────┐\n"
+                f"│   🎰 刮 刮 乐   │\n"
+                f"├─────────────────┤\n"
+                f"│  {slots[0]}  │  {slots[1]}  │  {slots[2]}  │\n"
+                f"├─────────────────┤\n"
+                f"│  {prize_name}！\n"
+                f"│  💰 奖金：{winnings}元\n"
+                f"│  📊 净收益：{net_str}元\n"
+                f"│  💳 余额：{balance}元\n"
+                f"└─────────────────┘"
+            )
+        else:
+            slots = [random.choice(["❌", "😅"]), random.choice(symbols), random.choice(["❌", "😅"])]
+            result = (
+                f"┌─────────────────┐\n"
+                f"│   🎰 刮 刮 乐   │\n"
+                f"├─────────────────┤\n"
+                f"│  {slots[0]}  │  {slots[1]}  │  {slots[2]}  │\n"
+                f"├─────────────────┤\n"
+                f"│  {prize_name}\n"
+                f"│  💸 花费 {ticket_price}元\n"
+                f"│  💳 余额：{balance}元\n"
+                f"└─────────────────┘"
+            )
+        return result
+
+    @staticmethod
+    def format_slots_immersive(desc: str, winnings: float, bet: float, reels: List[str], balance: float) -> str:
+        """老虎机 LLM 工具沉浸式输出（类似指令格式）"""
+        net = round(winnings - bet, 2)
+        header = (
+            f"┌─────────────────┐\n"
+            f"│   🎰 老 虎 机   │\n"
+            f"├─────────────────┤\n"
+            f"│  ┃ {reels[0]} ┃ {reels[1]} ┃ {reels[2]} ┃  │\n"
+            f"├─────────────────┤\n"
+        )
+        if winnings > 0:
+            net_str = f"+{net}" if net >= 0 else str(net)
+            body = (
+                f"│  {desc}\n"
+                f"│  💰 奖金：{winnings}元\n"
+                f"│  📊 净赚：{net_str}元\n"
+                f"│  💳 余额：{balance}元\n"
+            )
+        else:
+            body = (
+                f"│  {desc}\n"
+                f"│  💸 投入 {bet}元\n"
+                f"│  💳 余额：{balance}元\n"
+            )
+        return header + body + f"└─────────────────┘"
+
+    # ============================================================
+    #  21点 (Blackjack)
+    # ============================================================
+
+    CARD_SUITS = ["♠️", "♥️", "♣️", "♦️"]
+    CARD_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+
+    @staticmethod
+    def _card_value(rank: str) -> int:
+        """单张牌的基础点数"""
+        if rank in ("J", "Q", "K"):
+            return 10
+        if rank == "A":
+            return 11
+        return int(rank)
+
+    @staticmethod
+    def _hand_value(hand: List[Dict]) -> int:
+        """计算手牌总点数（A自动降为1）"""
+        total = sum(GamesManager._card_value(c["rank"]) for c in hand)
+        aces = sum(1 for c in hand if c["rank"] == "A")
+        while total > 21 and aces > 0:
+            total -= 10
+            aces -= 1
+        return total
+
+    @staticmethod
+    def _format_hand(hand: List[Dict], hide_second: bool = False) -> str:
+        """格式化手牌显示"""
+        if hide_second and len(hand) >= 2:
+            return f"{hand[0]['suit']}{hand[0]['rank']}  🂠"
+        return "  ".join(f"{c['suit']}{c['rank']}" for c in hand)
+
+    def _new_deck(self) -> List[Dict]:
+        """创建一副洗好的牌"""
+        deck = []
+        for suit in self.CARD_SUITS:
+            for rank in self.CARD_RANKS:
+                deck.append({"suit": suit, "rank": rank})
+        random.shuffle(deck)
+        return deck
+
+    def start_blackjack(self, user_id: str, bet: float) -> Dict:
+        """
+        开始21点游戏
+        :return: 游戏状态dict
+        """
+        deck = self._new_deck()
+        player_hand = [deck.pop(), deck.pop()]
+        dealer_hand = [deck.pop(), deck.pop()]
+
+        game = {
+            "user_id": user_id,
+            "bet": bet,
+            "deck": deck,
+            "player_hand": player_hand,
+            "dealer_hand": dealer_hand,
+            "status": "playing",  # playing / player_bust / dealer_bust / player_win / dealer_win / push / blackjack
+        }
+
+        # 检查天胡21点
+        player_val = self._hand_value(player_hand)
+        dealer_val = self._hand_value(dealer_hand)
+        if player_val == 21 and dealer_val == 21:
+            game["status"] = "push"
+        elif player_val == 21:
+            game["status"] = "blackjack"
+        elif dealer_val == 21:
+            game["status"] = "dealer_win"
+
+        return game
+
+    def blackjack_hit(self, game: Dict) -> Dict:
+        """玩家要牌"""
+        if game["status"] != "playing":
+            return game
+        card = game["deck"].pop()
+        game["player_hand"].append(card)
+        if self._hand_value(game["player_hand"]) > 21:
+            game["status"] = "player_bust"
+        return game
+
+    def blackjack_stand(self, game: Dict) -> Dict:
+        """玩家停牌，庄家按规则补牌"""
+        if game["status"] != "playing":
+            return game
+
+        # 庄家补牌规则：< 17必须补
+        while self._hand_value(game["dealer_hand"]) < 17:
+            game["dealer_hand"].append(game["deck"].pop())
+
+        player_val = self._hand_value(game["player_hand"])
+        dealer_val = self._hand_value(game["dealer_hand"])
+
+        if dealer_val > 21:
+            game["status"] = "dealer_bust"
+        elif player_val > dealer_val:
+            game["status"] = "player_win"
+        elif player_val < dealer_val:
+            game["status"] = "dealer_win"
+        else:
+            game["status"] = "push"
+
+        return game
+
+    def blackjack_double(self, game: Dict) -> Dict:
+        """加倍：只能在初始两张牌时使用，加倍赌注并只拿一张牌然后自动停牌"""
+        if game["status"] != "playing" or len(game["player_hand"]) != 2:
+            return game
+        game["bet"] = round(game["bet"] * 2, 2)
+        card = game["deck"].pop()
+        game["player_hand"].append(card)
+        if self._hand_value(game["player_hand"]) > 21:
+            game["status"] = "player_bust"
+        else:
+            game = self.blackjack_stand(game)
+        return game
+
+    def blackjack_settle(self, game: Dict) -> Tuple[float, str]:
+        """
+        结算21点
+        :return: (净收益, 结果描述) 正数=赢钱 负数=输钱 0=平局
+        """
+        bet = game["bet"]
+        status = game["status"]
+        player_val = self._hand_value(game["player_hand"])
+        dealer_val = self._hand_value(game["dealer_hand"])
+
+        if status == "blackjack":
+            winnings = round(bet * 1.5, 2)  # 天胡21点赔1.5倍
+            return winnings, "🃏 Blackjack！天胡21点！"
+        elif status == "player_bust":
+            return -bet, "💥 爆牌了！超过21点"
+        elif status == "dealer_bust":
+            return bet, f"🎉 庄家爆牌！（庄家 {dealer_val} 点）"
+        elif status == "player_win":
+            return bet, f"🎉 你赢了！（{player_val} vs 庄家 {dealer_val}）"
+        elif status == "dealer_win":
+            return -bet, f"😢 庄家赢了（{player_val} vs 庄家 {dealer_val}）"
+        elif status == "push":
+            return 0, f"🤝 平局！（都是 {player_val} 点）"
+        return 0, "未知状态"
+
+    def format_blackjack_table(self, game: Dict, reveal_dealer: bool = False) -> str:
+        """格式化21点牌桌显示"""
+        player_val = self._hand_value(game["player_hand"])
+        hide = not reveal_dealer and game["status"] == "playing"
+        dealer_display = self._format_hand(game["dealer_hand"], hide_second=hide)
+        if hide:
+            dealer_val_str = f"{self._card_value(game['dealer_hand'][0]['rank'])}+?"
+        else:
+            dealer_val_str = str(self._hand_value(game["dealer_hand"]))
+
+        player_display = self._format_hand(game["player_hand"])
+
+        table = (
+            f"┌──────────────────────┐\n"
+            f"│    🃏  21点  🃏      │\n"
+            f"├──────────────────────┤\n"
+            f"│ 庄家：{dealer_display}\n"
+            f"│ 　　　（{dealer_val_str}点）\n"
+            f"│                      │\n"
+            f"│ 你的：{player_display}\n"
+            f"│ 　　　（{player_val}点）\n"
+            f"├──────────────────────┤\n"
+            f"│ 💰 赌注：{game['bet']}元\n"
+            f"└──────────────────────┘"
+        )
+        return table
+
+    def record_blackjack_stats(self, user_id: str, bet: float, net: float, status: str = ""):
+        """记录21点统计"""
+        stats = self.data.setdefault("blackjack_stats", {})
+        user_stats = stats.setdefault(user_id, {
+            "played": 0, "won": 0, "lost": 0, "push": 0,
+            "total_bet": 0, "total_net": 0, "blackjacks": 0
+        })
+        user_stats["played"] += 1
+        user_stats["total_bet"] = round(user_stats["total_bet"] + bet, 2)
+        user_stats["total_net"] = round(user_stats["total_net"] + net, 2)
+        if net > 0:
+            user_stats["won"] += 1
+        elif net < 0:
+            user_stats["lost"] += 1
+        else:
+            user_stats["push"] += 1
+        if status == "blackjack":
+            user_stats["blackjacks"] = user_stats.get("blackjacks", 0) + 1
+        self._save_data()
+
+    def get_blackjack_stats(self, user_id: str) -> Dict:
+        """获取用户21点统计"""
+        return self.data.get("blackjack_stats", {}).get(
+            user_id, {"played": 0, "won": 0, "lost": 0, "push": 0,
+                       "total_bet": 0, "total_net": 0, "blackjacks": 0}
+        )

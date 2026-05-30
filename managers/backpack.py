@@ -188,6 +188,36 @@ class BackpackManager:
     def get_all_user_slots(self) -> Dict[str, List[Dict[str, Any]]]:
         return self.data.get("user_slots", {})
 
+    # ========== 用户格子白名单 ==========
+
+    def get_slots_whitelist(self) -> List[str]:
+        """获取有权使用专属格子的用户ID列表"""
+        return self.data.get("slots_whitelist", [])
+
+    def is_user_slots_allowed(self, user_id: str, is_admin: bool = False) -> bool:
+        """检查用户是否有权使用专属格子（管理员始终有权）"""
+        if is_admin:
+            return True
+        return user_id in self.data.get("slots_whitelist", [])
+
+    def add_to_slots_whitelist(self, user_id: str) -> bool:
+        """将用户加入格子白名单"""
+        whitelist = self.data.setdefault("slots_whitelist", [])
+        if user_id not in whitelist:
+            whitelist.append(user_id)
+            self._save_data()
+            return True
+        return False
+
+    def remove_from_slots_whitelist(self, user_id: str) -> bool:
+        """将用户从格子白名单移除"""
+        whitelist = self.data.get("slots_whitelist", [])
+        if user_id in whitelist:
+            whitelist.remove(user_id)
+            self._save_data()
+            return True
+        return False
+
     # ========== 格式化方法 ==========
 
     def format_shared_items_for_prompt(self) -> str:

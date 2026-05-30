@@ -8,6 +8,7 @@ from .turtle_soup import TurtleSoupManager
 from .level import LevelManager
 from .bank import BankManager
 from .achievement import AchievementManager
+from .tarot import TarotManager
 
 from .gift import GiftManager, sign_gift, verify_gift
 
@@ -22,6 +23,7 @@ __all__ = [
     "LevelManager",
     "BankManager",
     "AchievementManager",
+    "TarotManager",
     "GiftManager",
     "sign_gift",
     "verify_gift",

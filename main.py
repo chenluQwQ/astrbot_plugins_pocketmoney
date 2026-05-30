@@ -45,6 +45,7 @@ from .managers import (
     BankManager,
     AchievementManager,
     GiftManager,
+    TarotManager,
     verify_gift,
 )
 
@@ -104,6 +105,11 @@ class PocketMoneyPlugin(Star):
         self.achievement_manager = AchievementManager(self.data_dir)
         self.gift_manager = GiftManager(self.data_dir)
         self.turtle_soup_manager = TurtleSoupManager(self.data_dir)
+        self.tarot_manager = TarotManager(self.data_dir)
+        # 设置塔罗牌图片目录（插件根目录下的 images/tarot/）
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        tarot_images_dir = os.path.join(plugin_dir, "images", "tarot")
+        self.tarot_manager.set_images_dir(tarot_images_dir)
 
         # 赠送系统配置
         self._gift_bot_name = cfg("gift_bot_name", "")
@@ -118,7 +124,8 @@ class PocketMoneyPlugin(Star):
                 "pm_sign_in", "pm_view_shop", "pm_buy_item", "pm_view_stocks",
                 "pm_buy_stock", "pm_sell_stock", "pm_check_balance",
                 "pm_play_scratch", "pm_give_to_user", "pm_use_user_item", "pm_gift_item",
-                "pm_play_slots", "pm_toggle_games",
+                "pm_play_slots", "pm_toggle_games", "pm_play_blackjack",
+                "pm_tarot",
             ]:
                 try:
                     self.context.activate_llm_tool(tool_name)
@@ -137,7 +144,8 @@ class PocketMoneyPlugin(Star):
             "pm_sign_in", "pm_view_shop", "pm_buy_item", "pm_view_stocks",
             "pm_buy_stock", "pm_sell_stock", "pm_check_balance",
             "pm_play_scratch", "pm_give_to_user", "pm_use_user_item",
-            "pm_gift_item", "pm_play_slots",
+            "pm_gift_item", "pm_play_slots", "pm_play_blackjack",
+            "pm_tarot",
         ]
 
         # ---------- 正则表达式 ----------
@@ -458,7 +466,12 @@ class PocketMoneyPlugin(Star):
                     gd = self.gift_desc_pattern.search(block)
                     gift_from = gf.group(1).strip() if gf else current_user_name
                     gift_desc = gd.group(1).strip() if gd else "无描述"
-                    backpack_mgr.add_user_gift(current_user_id, gift_name, gift_desc, gift_from)
+                    # 检查用户是否有格子权限，没有则放入共享背包
+                    is_admin_user = self._is_admin(event)
+                    if backpack_mgr.is_user_slots_allowed(current_user_id, is_admin=is_admin_user):
+                        backpack_mgr.add_user_gift(current_user_id, gift_name, gift_desc, gift_from)
+                    else:
+                        backpack_mgr.add_shared_item(gift_name, f"来自{gift_from}: {gift_desc}")
 
         # --- 退款 ---
         refund_matches = list(self.refund_pattern.finditer(cleaned_text))
@@ -2090,7 +2103,11 @@ class PocketMoneyPlugin(Star):
             "  刮刮乐 | 刮刮乐统计\n"
             "  老虎机 [金额] | 老虎机统计\n"
             "  猜大 <金额> | 猜小 <金额>\n"
+            "  21点 <金额> | 要牌 | 停牌 | 加倍 | 21点统计\n"
             "  股市 | 买股票 <代码> <数量> | 卖股票 <代码> <数量> | 我的股票\n\n"
+            "🔮 塔罗占卜\n"
+            "  塔罗 单牌/三牌/六芒星 [问题]\n"
+            "  今日运势 | 塔罗统计\n\n"
             "🐢 海龟汤\n"
             "  海龟汤 [编号] | 海龟汤列表 | 海龟汤搜索\n"
             "  游戏中：猜汤底 <猜测> | 揭晓汤底 | 换汤 | 退出海龟汤\n\n"
@@ -2104,6 +2121,7 @@ class PocketMoneyPlugin(Star):
             "  发零花钱 | 扣零花钱 | 设置余额 | 查账 | 查流水 | 清空流水\n"
             "  存入存折 | 查看存折 | 批准取款 | 拒绝取款 | 直接取款 | 待审批取款\n"
             "  查看背包 | 清空背包 | 背包移除 | 查看专属格子 | 清空专属格子\n"
+            "  开放格子 <QQ号> | 关闭格子 <QQ号> | 格子白名单\n"
             "  追加笔记 | 查看笔记 | 删除笔记 | 清空笔记\n"
             "  零花钱拉黑 | 零花钱解除拉黑 | 零花钱黑名单 | 零花钱隔离池\n"
             "  刷新超市\n\n"
@@ -2463,7 +2481,7 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_play_scratch")
     async def tool_play_scratch(self, event: AstrMessageEvent):
-        '''刮刮乐，3元一张。
+        '''刮刮乐，3元一张。返回结果面板请原样输出，不要改写。
 
         Args:
         '''
@@ -2478,12 +2496,12 @@ class PocketMoneyPlugin(Star):
         if winnings > 0:
             money_mgr.data["balance"] = round(money_mgr.get_balance() + winnings, 2)
             money_mgr._save_data()
-        net = round(winnings - ticket_price, 2)
-        return f"刮刮乐结果：{prize_name}！奖金{winnings}元（净{'+' if net>=0 else ''}{net}元），余额{money_mgr.get_balance()}元"
+        panel = GamesManager.format_scratch_immersive(prize_name, winnings, ticket_price, money_mgr.get_balance())
+        return f"请将以下刮刮乐面板原样发送给用户，不要缩写或口述，可以在面板后加一句简短评论：\n\n{panel}"
 
     @llm_tool(name="pm_play_slots")
     async def tool_play_slots(self, event: AstrMessageEvent):
-        '''老虎机，默认5元一次，三个相同符号大奖。
+        '''老虎机，默认5元一次，三个相同符号大奖。返回结果面板请原样输出，不要改写。
 
         Args:
         '''
@@ -2498,8 +2516,64 @@ class PocketMoneyPlugin(Star):
         if winnings > 0:
             money_mgr.data["balance"] = round(money_mgr.get_balance() + winnings, 2)
             money_mgr._save_data()
-        net = round(winnings - bet, 2)
-        return f"老虎机：┃{reels[0]}┃{reels[1]}┃{reels[2]}┃ {desc}。{'奖金' + str(winnings) + '元，净' + ('+' if net>=0 else '') + str(net) + '元' if winnings > 0 else '没中，-' + str(bet) + '元'}，余额{money_mgr.get_balance()}元"
+        panel = GamesManager.format_slots_immersive(desc, winnings, bet, reels, money_mgr.get_balance())
+        return f"请将以下老虎机面板原样发送给用户，不要缩写或口述，可以在面板后加一句简短评论：\n\n{panel}"
+
+    @llm_tool(name="pm_play_blackjack")
+    async def tool_play_blackjack(self, event: AstrMessageEvent, bet: str):
+        '''21点游戏，下注后发牌。返回牌桌面板请原样输出，不要改写。开局后玩家需要通过「要牌」「停牌」「加倍」指令继续。
+
+        Args:
+            bet(string): 下注金额
+        '''
+        self.__init_blackjack_sessions()
+        session_key = self._bj_session_key(event)
+
+        if session_key in self._blackjack_sessions:
+            game = self._blackjack_sessions[session_key]
+            if game["status"] == "playing":
+                panel = self.games_manager.format_blackjack_table(game) + "\n\n🃏 游戏进行中！回复「要牌」「停牌」「加倍」"
+                return f"请将以下牌桌面板原样发送给用户，不要缩写或口述：\n\n{panel}"
+
+        ok, bet_val = self._parse_amount(bet)
+        if not ok:
+            return f"错误：{bet_val}"
+
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+
+        if bet_val > money_mgr.get_balance():
+            return f"余额不足！当前 {money_mgr.get_balance()}元"
+
+        money_mgr.add_expense(bet_val, "21点", user_id, isolation=is_isolated)
+        if is_isolated:
+            self.isolation_manager.add_pending_refund(bet_val, "21点", user_id)
+
+        game = self.games_manager.start_blackjack(user_id, bet_val)
+        self._blackjack_sessions[session_key] = game
+
+        if game["status"] != "playing":
+            net, result_desc = self.games_manager.blackjack_settle(game)
+            if net > 0:
+                money_mgr.data["balance"] = round(money_mgr.get_balance() + bet_val + net, 2)
+                money_mgr._save_data()
+            elif net == 0:
+                money_mgr.data["balance"] = round(money_mgr.get_balance() + bet_val, 2)
+                money_mgr._save_data()
+            self.games_manager.record_blackjack_stats(user_id, bet_val, net, game["status"])
+            del self._blackjack_sessions[session_key]
+            net_str = f"+{net}" if net >= 0 else str(net)
+            panel = (
+                self.games_manager.format_blackjack_table(game, reveal_dealer=True) +
+                f"\n\n{result_desc}\n💰 净收益：{net_str}元\n💳 余额：{money_mgr.get_balance()}元"
+            )
+            return f"请将以下牌桌面板原样发送给用户，不要缩写或口述，可以在面板后加一句简短评论：\n\n{panel}"
+        else:
+            panel = (
+                self.games_manager.format_blackjack_table(game) +
+                "\n\n🃏 回复「要牌」继续拿牌\n🃏 回复「停牌」让庄家翻牌\n🃏 回复「加倍」加倍赌注并只拿一张牌"
+            )
+            return f"请将以下牌桌面板原样发送给用户，不要缩写或口述：\n\n{panel}"
 
     # ===============================================================
     #  跨bot赠送系统
@@ -2507,7 +2581,7 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_give_to_user")
     async def tool_give_to_user(self, event: AstrMessageEvent, item_name: str):
-        '''把共享背包的物品送给当前用户，放入其专属格子。
+        '''把共享背包的物品送给当前用户。如果用户有专属格子权限则放入格子，否则直接发话送出。
 
         Args:
             item_name(string): 物品名称
@@ -2525,19 +2599,24 @@ class PocketMoneyPlugin(Star):
         if not found:
             return f"背包里没有「{item_name}」"
 
-        # 检查用户格子空间
-        if self.backpack_manager.is_user_slots_full(user_id):
-            return f"{user_name}的格子满了，放不下"
-
-        # 从共享背包取出 → 放入用户格子
+        is_admin_user = self._is_admin(event)
         desc = found.get("description", "")
         expires = found.get("expires_at")
-        self.backpack_manager.use_shared_item(found["name"])
-        self.backpack_manager.add_user_gift(
-            user_id, found["name"], desc,
-            "背包赠送", expires_at=expires,
-        )
-        return f"已把「{found['name']}」送给{user_name}，放进了ta的专属格子"
+
+        if self.backpack_manager.is_user_slots_allowed(user_id, is_admin=is_admin_user):
+            # 有格子权限 → 放入专属格子
+            if self.backpack_manager.is_user_slots_full(user_id):
+                return f"{user_name}的格子满了，放不下"
+            self.backpack_manager.use_shared_item(found["name"])
+            self.backpack_manager.add_user_gift(
+                user_id, found["name"], desc,
+                "背包赠送", expires_at=expires,
+            )
+            return f"已把「{found['name']}」送给{user_name}，放进了ta的专属格子"
+        else:
+            # 没有格子权限 → 从共享背包取出，直接"送出"（不入格子）
+            self.backpack_manager.use_shared_item(found["name"])
+            return f"已把「{found['name']}」送给{user_name}啦~（{desc}）"
 
     @llm_tool(name="pm_use_user_item")
     async def tool_use_user_item(self, event: AstrMessageEvent, item_name: str):
@@ -2556,11 +2635,11 @@ class PocketMoneyPlugin(Star):
         return f"没有找到「{item_name}」"
 
     @llm_tool(name="pm_gift_item")
-    async def tool_gift_item(self, event: AstrMessageEvent, item_name: str, to_user: str):
-        '''跨bot赠送物品。
+    async def tool_gift_item(self, event: AstrMessageEvent, item_names: str, to_user: str):
+        '''跨bot赠送物品，支持一次赠送多个。多个物品用逗号分隔。
 
         Args:
-            item_name(string): 物品名称
+            item_names(string): 物品名称，多个用逗号/顿号分隔，如 "苹果,蛋糕" 或 "苹果、蛋糕"
             to_user(string): 对象名字
         '''
         if not self._gift_bot_name:
@@ -2569,46 +2648,74 @@ class PocketMoneyPlugin(Star):
         user_id = event.get_sender_id()
         _, backpack_mgr, _ = self._get_managers_for_user(user_id)
 
-        # 查找物品
-        items = backpack_mgr.get_user_items(user_id)
-        found = None
-        for item in items:
-            if _name_match(item["name"], item_name):
-                found = item
-                break
-        if not found:
-            shared = backpack_mgr.get_shared_items()
-            for item in shared:
-                if _name_match(item["name"], item_name):
+        # 解析多个物品名
+        import re as _re
+        names = [n.strip() for n in _re.split(r'[,，、]', item_names) if n.strip()]
+        if not names:
+            return "请指定要赠送的物品名称"
+
+        # 先收集所有要赠送的物品（验证阶段，不修改数据）
+        found_items = []
+        not_found = []
+        for name in names:
+            found = None
+            source = None
+            # 先找用户格子
+            items = backpack_mgr.get_user_items(user_id)
+            for item in items:
+                if _name_match(item["name"], name):
                     found = item
-                    found["_from_shared"] = True
+                    source = "user"
                     break
-        if not found:
-            return f"背包里没有「{item_name}」"
+            # 再找共享背包
+            if not found:
+                shared = backpack_mgr.get_shared_items()
+                for item in shared:
+                    if _name_match(item["name"], name):
+                        found = item
+                        source = "shared"
+                        break
+            if found:
+                found_items.append((found, source))
+            else:
+                not_found.append(name)
 
-        # 从背包取出
-        if found.get("_from_shared"):
-            backpack_mgr.use_shared_item(found["name"])
-        else:
-            backpack_mgr.use_user_item(user_id, found["name"])
+        if not found_items:
+            return f"背包里没有找到这些物品：{'、'.join(not_found)}"
 
-        # 创建赠送记录
-        record = self.gift_manager.create_outgoing(
-            item_name=found["name"],
-            item_desc=found.get("description", found.get("desc", "")),
-            from_bot=self._gift_bot_name,
-            to_user=to_user,
-            sender_user_id=user_id,
-            expires_at=found.get("expires_at"),
-        )
+        # 执行赠送（修改数据阶段）
+        sent_names = []
+        for found, source in found_items:
+            # 从背包取出
+            if source == "shared":
+                backpack_mgr.use_shared_item(found["name"])
+            else:
+                backpack_mgr.use_user_item(user_id, found["name"])
 
-        # 直接发送赠送消息到群里（不能让LLM改写）
-        gift_msg = GiftManager.format_gift_offer(
-            self._gift_bot_name, found["name"], to_user,
-            record["timestamp"], record["signature"],
-        )
-        await event.send(event.plain_result(gift_msg))
-        return f"已发出赠送「{found['name']}」给{to_user}的请求，等待对方bot接收（5分钟超时自动退回）"
+            # 创建赠送记录
+            record = self.gift_manager.create_outgoing(
+                item_name=found["name"],
+                item_desc=found.get("description", found.get("desc", "")),
+                from_bot=self._gift_bot_name,
+                to_user=to_user,
+                sender_user_id=user_id,
+                expires_at=found.get("expires_at"),
+            )
+
+            # 发送赠送消息
+            gift_msg = GiftManager.format_gift_offer(
+                self._gift_bot_name, found["name"], to_user,
+                record["timestamp"], record["signature"],
+            )
+            await event.send(event.plain_result(gift_msg))
+            sent_names.append(found["name"])
+
+        result_parts = []
+        if sent_names:
+            result_parts.append(f"已发出赠送{'、'.join(f'「{n}」' for n in sent_names)}给{to_user}的请求，等待对方bot接收（5分钟超时自动退回）")
+        if not_found:
+            result_parts.append(f"以下物品未找到：{'、'.join(not_found)}")
+        return "。".join(result_parts)
 
     @filter.regex(r"「.+?」发起赠送「.+?」给 @.+?，是否接收？\[GK:[a-f0-9]{6}:\d+\]")
     async def on_gift_offer(self, event: AstrMessageEvent):
@@ -2763,6 +2870,494 @@ class PocketMoneyPlugin(Star):
             yield event.plain_result(flavor)
 
     # ===============================================================
+    #  塔罗占卜系统
+    # ===============================================================
+
+    @filter.command("塔罗")
+    async def tarot_reading(self, event: AstrMessageEvent, spread_arg: str = "", *, question: str = ""):
+        """塔罗占卜：单牌/三牌/六芒星"""
+        if not spread_arg.strip():
+            yield event.plain_result(self.tarot_manager.format_menu()); return
+
+        # 解析牌阵类型
+        spread_map = {
+            "单牌": "single", "单": "single", "1": "single", "one": "single",
+            "三牌": "three", "三": "three", "3": "three", "three": "three",
+            "时间之流": "three", "过去现在未来": "three",
+            "六芒星": "hexagram", "六": "hexagram", "6": "hexagram", "hex": "hexagram",
+        }
+        spread_type = spread_map.get(spread_arg.strip(), "")
+        if not spread_type:
+            yield event.plain_result(
+                f"未知牌阵「{spread_arg}」\n"
+                "可选：单牌 / 三牌 / 六芒星\n"
+                "例如：塔罗 三牌 我的感情运势如何"
+            ); return
+
+        spread = self.tarot_manager.SPREADS[spread_type]
+        price = spread["price"]
+
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+
+        if price > money_mgr.get_balance():
+            yield event.plain_result(
+                f"余额不足！{spread['name']}需要 {price}元，当前余额 {money_mgr.get_balance()}元"
+            ); return
+
+        # 扣费
+        money_mgr.add_expense(price, f"塔罗占卜：{spread['name']}", user_id, isolation=is_isolated)
+        if is_isolated:
+            self.isolation_manager.add_pending_refund(price, f"塔罗：{spread['name']}", user_id)
+
+        # 抽牌
+        cards = self.tarot_manager.draw_cards(spread["count"])
+        self.tarot_manager.record_reading(user_id, spread_type)
+
+        # LLM 解读
+        interpretation = ""
+        try:
+            umo = event.unified_msg_origin
+            prov_id = await self.context.get_current_chat_provider_id(umo=umo)
+            if prov_id:
+                prompt = TarotManager.build_interpretation_prompt(
+                    spread["name"], cards, spread["labels"], question.strip()
+                )
+                llm_resp = await self.context.llm_generate(
+                    chat_provider_id=prov_id, prompt=prompt,
+                )
+                resp_text = (llm_resp.completion_text or "").strip()
+                if resp_text:
+                    interpretation = resp_text
+        except Exception as e:
+            logger.debug(f"[Tarot] LLM 解读失败: {e}")
+
+        # 构造图文混排消息链
+        chain = self._build_tarot_chain(
+            spread_type, cards, spread["labels"], spread["name"],
+            price, money_mgr.get_balance(), interpretation
+        )
+        if chain:
+            yield event.chain_result(chain)
+        else:
+            # 无图片兜底：纯文字
+            display = self.tarot_manager.format_spread_display(spread_type, cards)
+            display += f"\n\n💰 花费 {price}元 | 💳 余额 {money_mgr.get_balance()}元"
+            if interpretation:
+                display += f"\n\n🔮 解读：\n{interpretation}"
+            yield event.plain_result(display)
+
+        self._check_achievements(user_id)
+
+    @filter.command("今日运势")
+    async def daily_fortune(self, event: AstrMessageEvent):
+        """每日运势（免费，每日一次）"""
+        user_id = event.get_sender_id()
+
+        if self.tarot_manager.has_daily_fortune_today(user_id):
+            yield event.plain_result("🌅 你今天已经看过运势啦，明天再来~"); return
+
+        # 抽三张
+        cards = self.tarot_manager.draw_cards(3)
+        self.tarot_manager.record_daily_fortune(user_id)
+        self.tarot_manager.record_reading(user_id, "daily")
+
+        # LLM 解读
+        interpretation = ""
+        try:
+            umo = event.unified_msg_origin
+            prov_id = await self.context.get_current_chat_provider_id(umo=umo)
+            if prov_id:
+                prompt = TarotManager.build_daily_prompt(cards)
+                llm_resp = await self.context.llm_generate(
+                    chat_provider_id=prov_id, prompt=prompt,
+                )
+                resp_text = (llm_resp.completion_text or "").strip()
+                if resp_text:
+                    interpretation = resp_text
+        except Exception as e:
+            logger.debug(f"[Tarot] 日运 LLM 解读失败: {e}")
+
+        # 构造图文混排消息链
+        daily_labels = ["总运", "事业/学业", "感情"]
+        chain = self._build_tarot_chain(
+            "daily", cards, daily_labels, "今日运势",
+            0, 0, interpretation
+        )
+        if chain:
+            yield event.chain_result(chain)
+        else:
+            display = self.tarot_manager.format_daily_display(cards)
+            if interpretation:
+                display += f"\n\n🔮 {interpretation}"
+            yield event.plain_result(display)
+
+    def _build_tarot_chain(self, spread_type: str, cards: List[Dict],
+                            labels: List[str], title: str,
+                            price: float, balance: float,
+                            interpretation: str = "") -> Optional[List]:
+        """
+        构造塔罗图文混排消息链 [Plain, Image, Plain, Image, ...]
+        如果没有图片则返回 None（走纯文字兜底）
+        """
+        if not self.tarot_manager.has_images():
+            return None
+
+        try:
+            chain = []
+
+            # 标题
+            if spread_type == "daily":
+                chain.append(Comp.Plain("🌅 ── 今日运势 ──\n\n"))
+            else:
+                chain.append(Comp.Plain(f"🔮 ── {title} ──\n\n"))
+
+            # 逐张牌：文字标签 + 图片
+            for i, card in enumerate(cards):
+                label = labels[i] if i < len(labels) else f"第{i+1}张"
+                pos_icon = "△" if card["position"] == "正位" else "▽"
+                card_text = f"【{label}】{card['name']}（{pos_icon}{card['position']}）\n"
+                chain.append(Comp.Plain(card_text))
+
+                img_path = self.tarot_manager.get_card_image_path(card)
+                if img_path:
+                    chain.append(Comp.Image.fromFileSystem(img_path))
+
+                # 关键词
+                chain.append(Comp.Plain(f"🔑 {card['keywords']}\n\n"))
+
+            # 费用信息（占卜才有，日运免费）
+            if price > 0:
+                chain.append(Comp.Plain(f"💰 花费 {price}元 | 💳 余额 {balance}元\n"))
+
+            # LLM 解读
+            if interpretation:
+                chain.append(Comp.Plain(f"\n🔮 解读：\n{interpretation}"))
+
+            return chain
+        except Exception as e:
+            logger.debug(f"[Tarot] 构造图文链失败: {e}")
+            return None
+
+    @filter.command("塔罗统计")
+    async def tarot_stats(self, event: AstrMessageEvent):
+        """查看塔罗统计"""
+        user_id = event.get_sender_id()
+        stats = self.tarot_manager.get_stats(user_id)
+        if stats["total"] == 0:
+            yield event.plain_result("🔮 你还没做过塔罗占卜呢，试试「塔罗 单牌」吧~"); return
+        lines = [f"🔮 你的塔罗统计：\n  📊 总占卜次数：{stats['total']}"]
+        spread_names = {
+            "single": "单牌", "three": "时间之流", "hexagram": "六芒星", "daily": "日运"
+        }
+        for key, count in stats.get("spreads", {}).items():
+            name = spread_names.get(key, key)
+            lines.append(f"  🃏 {name}：{count}次")
+        yield event.plain_result("\n".join(lines))
+
+    @llm_tool(name="pm_tarot")
+    async def tool_tarot(self, event: AstrMessageEvent, spread_type: str, question: str = ""):
+        '''塔罗占卜。返回牌面面板请原样输出，不要改写。
+
+        Args:
+            spread_type(string): 牌阵类型："单牌"、"三牌"、"六芒星"、"日运"
+            question(string): 提问者的问题（可选）
+        '''
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+
+        # 日运特殊处理
+        if "日运" in spread_type or "运势" in spread_type:
+            if self.tarot_manager.has_daily_fortune_today(user_id):
+                return "今天已经看过运势啦，明天再来~"
+            cards = self.tarot_manager.draw_cards(3)
+            self.tarot_manager.record_daily_fortune(user_id)
+            self.tarot_manager.record_reading(user_id, "daily")
+            return f"请将以下牌面原样发送给用户，不要改写：\n\n{self.tarot_manager.format_daily_display(cards)}"
+
+        # 解析牌阵
+        spread_map = {
+            "单牌": "single", "单": "single",
+            "三牌": "three", "三": "three", "时间之流": "three",
+            "六芒星": "hexagram", "六": "hexagram",
+        }
+        st = spread_map.get(spread_type.strip(), "three")
+        spread = self.tarot_manager.SPREADS[st]
+        price = spread["price"]
+
+        if price > money_mgr.get_balance():
+            return f"余额不足！{spread['name']}需要{price}元，当前余额{money_mgr.get_balance()}元"
+
+        money_mgr.add_expense(price, f"塔罗：{spread['name']}", user_id, isolation=is_isolated)
+        if is_isolated:
+            self.isolation_manager.add_pending_refund(price, f"塔罗：{spread['name']}", user_id)
+
+        cards = self.tarot_manager.draw_cards(spread["count"])
+        self.tarot_manager.record_reading(user_id, st)
+
+        display = self.tarot_manager.format_spread_display(st, cards)
+        display += f"\n\n💰 花费{price}元 | 💳 余额{money_mgr.get_balance()}元"
+        return f"请将以下牌面原样发送给用户，不要改写，可以在后面加一句简短的占卜感言：\n\n{display}"
+
+    # ===============================================================
+    #  用户格子白名单管理
+    # ===============================================================
+
+    @filter.command("开放格子")
+    async def add_user_slots_whitelist(self, event: AstrMessageEvent, user_id: str = ""):
+        """(管理员) 给指定用户开放专属格子权限"""
+        if not self._is_admin(event):
+            yield event.plain_result(self._admin_denied_msg()); return
+        user_id = user_id.strip()
+        if not user_id:
+            yield event.plain_result("请指定用户QQ号，例如：开放格子 123456"); return
+        if self.backpack_manager.add_to_slots_whitelist(user_id):
+            yield event.plain_result(f"✅ 用户 {user_id} 已获得专属格子权限")
+        else:
+            yield event.plain_result(f"用户 {user_id} 已有格子权限")
+
+    @filter.command("关闭格子")
+    async def remove_user_slots_whitelist(self, event: AstrMessageEvent, user_id: str = ""):
+        """(管理员) 取消指定用户的专属格子权限"""
+        if not self._is_admin(event):
+            yield event.plain_result(self._admin_denied_msg()); return
+        user_id = user_id.strip()
+        if not user_id:
+            yield event.plain_result("请指定用户QQ号，例如：关闭格子 123456"); return
+        if self.backpack_manager.remove_from_slots_whitelist(user_id):
+            yield event.plain_result(f"❌ 用户 {user_id} 的专属格子权限已取消")
+        else:
+            yield event.plain_result(f"用户 {user_id} 不在格子白名单中")
+
+    @filter.command("格子白名单")
+    async def view_slots_whitelist(self, event: AstrMessageEvent):
+        """(管理员) 查看有专属格子权限的用户列表"""
+        if not self._is_admin(event):
+            yield event.plain_result(self._admin_denied_msg()); return
+        whitelist = self.backpack_manager.get_slots_whitelist()
+        if not whitelist:
+            yield event.plain_result("🎁 格子白名单为空（只有管理员有格子权限）")
+        else:
+            lines = [f"🎁 专属格子白名单（{len(whitelist)}人）："]
+            for uid in whitelist:
+                items_count = self.backpack_manager.get_user_item_count(uid)
+                lines.append(f"  - {uid}（{items_count}件物品）")
+            lines.append("\n💡 管理员始终有格子权限")
+            yield event.plain_result("\n".join(lines))
+
+    # ===============================================================
+    #  小游戏：21点 (Blackjack)
+    # ===============================================================
+
+    def __init_blackjack_sessions(self):
+        """懒初始化21点会话存储"""
+        if not hasattr(self, '_blackjack_sessions'):
+            self._blackjack_sessions = {}
+
+    def _bj_session_key(self, event: AstrMessageEvent) -> str:
+        """21点会话key（与海龟汤类似）"""
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+        if group_id:
+            return f"bj_{group_id}_{user_id}"
+        return f"bj_private_{user_id}"
+
+    @filter.command("21点")
+    async def start_blackjack(self, event: AstrMessageEvent, bet_str: str = ""):
+        """开始21点游戏"""
+        self.__init_blackjack_sessions()
+        session_key = self._bj_session_key(event)
+
+        if session_key in self._blackjack_sessions:
+            game = self._blackjack_sessions[session_key]
+            if game["status"] == "playing":
+                yield event.plain_result(
+                    self.games_manager.format_blackjack_table(game) +
+                    "\n\n🃏 游戏进行中！回复「要牌」「停牌」「加倍」"
+                ); return
+
+        if not bet_str.strip():
+            yield event.plain_result("请下注金额，例如：21点 10"); return
+        ok, bet = self._parse_amount(bet_str)
+        if not ok:
+            yield event.plain_result(f"错误：{bet}"); return
+
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+
+        if bet > money_mgr.get_balance():
+            yield event.plain_result(f"余额不足！当前 {money_mgr.get_balance()}元"); return
+
+        # 扣钱
+        money_mgr.add_expense(bet, "21点", user_id, isolation=is_isolated)
+        if is_isolated:
+            self.isolation_manager.add_pending_refund(bet, "21点", user_id)
+
+        # 开局
+        game = self.games_manager.start_blackjack(user_id, bet)
+        self._blackjack_sessions[session_key] = game
+
+        if game["status"] != "playing":
+            # 天胡或庄家天胡
+            net, result_desc = self.games_manager.blackjack_settle(game)
+            if net > 0:
+                money_mgr.data["balance"] = round(money_mgr.get_balance() + bet + net, 2)
+                money_mgr._save_data()
+            elif net == 0:
+                # 平局退回赌注
+                money_mgr.data["balance"] = round(money_mgr.get_balance() + bet, 2)
+                money_mgr._save_data()
+            self.games_manager.record_blackjack_stats(user_id, bet, net, game["status"])
+            del self._blackjack_sessions[session_key]
+
+            net_str = f"+{net}" if net >= 0 else str(net)
+            yield event.plain_result(
+                self.games_manager.format_blackjack_table(game, reveal_dealer=True) +
+                f"\n\n{result_desc}\n💰 净收益：{net_str}元\n💳 余额：{money_mgr.get_balance()}元"
+            )
+            self._check_achievements(user_id)
+        else:
+            yield event.plain_result(
+                self.games_manager.format_blackjack_table(game) +
+                "\n\n🃏 回复「要牌」继续拿牌\n🃏 回复「停牌」让庄家翻牌\n🃏 回复「加倍」加倍赌注并只拿一张牌"
+            )
+
+    @filter.command("要牌")
+    async def blackjack_hit(self, event: AstrMessageEvent):
+        """21点要牌"""
+        self.__init_blackjack_sessions()
+        session_key = self._bj_session_key(event)
+        game = self._blackjack_sessions.get(session_key)
+        if not game or game["status"] != "playing":
+            yield event.plain_result("🃏 没有进行中的21点，发「21点 <金额>」开始~"); return
+
+        user_id = event.get_sender_id()
+        money_mgr, _, _ = self._get_managers_for_user(user_id)
+
+        game = self.games_manager.blackjack_hit(game)
+
+        if game["status"] != "playing":
+            # 爆了
+            net, result_desc = self.games_manager.blackjack_settle(game)
+            if net > 0:
+                money_mgr.data["balance"] = round(money_mgr.get_balance() + game["bet"] + net, 2)
+                money_mgr._save_data()
+            elif net == 0:
+                money_mgr.data["balance"] = round(money_mgr.get_balance() + game["bet"], 2)
+                money_mgr._save_data()
+            self.games_manager.record_blackjack_stats(user_id, game["bet"], net, game["status"])
+            del self._blackjack_sessions[session_key]
+
+            net_str = f"+{net}" if net >= 0 else str(net)
+            yield event.plain_result(
+                self.games_manager.format_blackjack_table(game, reveal_dealer=True) +
+                f"\n\n{result_desc}\n💰 净收益：{net_str}元\n💳 余额：{money_mgr.get_balance()}元"
+            )
+            self._check_achievements(user_id)
+        else:
+            player_val = GamesManager._hand_value(game["player_hand"])
+            yield event.plain_result(
+                self.games_manager.format_blackjack_table(game) +
+                f"\n\n当前 {player_val} 点，继续「要牌」还是「停牌」？"
+            )
+
+    @filter.command("停牌")
+    async def blackjack_stand(self, event: AstrMessageEvent):
+        """21点停牌"""
+        self.__init_blackjack_sessions()
+        session_key = self._bj_session_key(event)
+        game = self._blackjack_sessions.get(session_key)
+        if not game or game["status"] != "playing":
+            yield event.plain_result("🃏 没有进行中的21点，发「21点 <金额>」开始~"); return
+
+        user_id = event.get_sender_id()
+        money_mgr, _, _ = self._get_managers_for_user(user_id)
+
+        game = self.games_manager.blackjack_stand(game)
+        net, result_desc = self.games_manager.blackjack_settle(game)
+
+        if net > 0:
+            money_mgr.data["balance"] = round(money_mgr.get_balance() + game["bet"] + net, 2)
+            money_mgr._save_data()
+        elif net == 0:
+            money_mgr.data["balance"] = round(money_mgr.get_balance() + game["bet"], 2)
+            money_mgr._save_data()
+
+        self.games_manager.record_blackjack_stats(user_id, game["bet"], net, game["status"])
+        del self._blackjack_sessions[session_key]
+
+        net_str = f"+{net}" if net >= 0 else str(net)
+        yield event.plain_result(
+            self.games_manager.format_blackjack_table(game, reveal_dealer=True) +
+            f"\n\n{result_desc}\n💰 净收益：{net_str}元\n💳 余额：{money_mgr.get_balance()}元"
+        )
+        self._check_achievements(user_id)
+
+    @filter.command("加倍")
+    async def blackjack_double(self, event: AstrMessageEvent):
+        """21点加倍"""
+        self.__init_blackjack_sessions()
+        session_key = self._bj_session_key(event)
+        game = self._blackjack_sessions.get(session_key)
+        if not game or game["status"] != "playing":
+            yield event.plain_result("🃏 没有进行中的21点，发「21点 <金额>」开始~"); return
+
+        if len(game["player_hand"]) != 2:
+            yield event.plain_result("🃏 加倍只能在拿到初始两张牌时使用"); return
+
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+        extra_bet = game["bet"]  # 加倍的额外赌注
+
+        if extra_bet > money_mgr.get_balance():
+            yield event.plain_result(f"余额不足！加倍需要额外 {extra_bet}元，当前余额 {money_mgr.get_balance()}元"); return
+
+        # 扣额外赌注
+        money_mgr.add_expense(extra_bet, "21点加倍", user_id, isolation=is_isolated)
+        if is_isolated:
+            self.isolation_manager.add_pending_refund(extra_bet, "21点加倍", user_id)
+
+        game = self.games_manager.blackjack_double(game)
+        net, result_desc = self.games_manager.blackjack_settle(game)
+
+        if net > 0:
+            money_mgr.data["balance"] = round(money_mgr.get_balance() + game["bet"] + net, 2)
+            money_mgr._save_data()
+        elif net == 0:
+            money_mgr.data["balance"] = round(money_mgr.get_balance() + game["bet"], 2)
+            money_mgr._save_data()
+
+        self.games_manager.record_blackjack_stats(user_id, game["bet"], net, game["status"])
+        del self._blackjack_sessions[session_key]
+
+        net_str = f"+{net}" if net >= 0 else str(net)
+        yield event.plain_result(
+            self.games_manager.format_blackjack_table(game, reveal_dealer=True) +
+            f"\n\n🔥 加倍！赌注：{game['bet']}元\n{result_desc}\n💰 净收益：{net_str}元\n💳 余额：{money_mgr.get_balance()}元"
+        )
+        self._check_achievements(user_id)
+
+    @filter.command("21点统计")
+    async def blackjack_stats(self, event: AstrMessageEvent):
+        """查看21点统计"""
+        user_id = event.get_sender_id()
+        stats = self.games_manager.get_blackjack_stats(user_id)
+        if stats["played"] == 0:
+            yield event.plain_result("你还没玩过21点呢，试试「21点 <金额>」吧~"); return
+        net = stats["total_net"]
+        net_str = f"+{net}" if net >= 0 else str(net)
+        win_rate = round(stats["won"] / stats["played"] * 100, 1) if stats["played"] > 0 else 0
+        yield event.plain_result(
+            f"🃏 你的21点统计：\n"
+            f"  🎮 玩了 {stats['played']} 局\n"
+            f"  ✅ 赢 {stats['won']} | ❌ 输 {stats['lost']} | 🤝 平 {stats['push']}\n"
+            f"  📊 胜率 {win_rate}%\n"
+            f"  💰 总下注 {stats['total_bet']}元\n"
+            f"  📊 净盈亏 {net_str}元\n"
+            f"  🃏 Blackjack {stats.get('blackjacks', 0)}次"
+        )
+
+    # ===============================================================
     #  终止
     # ===============================================================
 
@@ -2787,3 +3382,4 @@ class PocketMoneyPlugin(Star):
         self.bank_manager._save_data()
         self.achievement_manager._save_data()
         self.gift_manager._save_data()
+        self.tarot_manager._save_data()
